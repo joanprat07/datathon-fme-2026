@@ -24,6 +24,9 @@ import numpy as np
 
 from twin.rt import ARTIFACTS
 from twin.state import C0, DEVICES, FEATURES, PAGES, State
+from twin.variants import Variant, intent_slate
+from twin.embeddings import semantic_candidates
+from twin.hybrid_live import EMB_FILE, EXTRA, Embeddings
 
 SLOT = C0 + 3
 EXPLOIT_SLOTS = 7      # slots filled by expected value; the rest explore
@@ -35,7 +38,10 @@ BLOCK_BOUGHT = True    # business rule: never recommend a product the shopper al
 class Ranker:
     def __init__(self, path=ARTIFACTS / "model"):
         meta = json.loads((path / "meta.json").read_text())
-        if meta["features"] != FEATURES:
+        self.emb = None
+        if meta["features"] == FEATURES + EXTRA:       # v5-hybrid: four more columns from twin/hybrid_live.py
+            self.emb = Embeddings(path / EMB_FILE)
+        elif meta["features"] != FEATURES:
             raise RuntimeError("the saved model was trained with a different feature list: run `python -m twin.train --refit`")
         self.click = lgb.Booster(model_file=str(path / "click.txt"))
         self.buy = lgb.Booster(model_file=str(path / "buy.txt"))
@@ -49,7 +55,8 @@ def top(scores: np.ndarray, k: int) -> np.ndarray:
     return np.argpartition(-scores, k)[:k]
 
 
-def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], rng: np.random.Generator) -> np.ndarray:
+def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], rng: np.random.Generator,
+               block_bought: bool = BLOCK_BOUGHT) -> np.ndarray:
     n = st.P
     picks: list[np.ndarray] = [st.pop_order[:40], top(st.car_clicks[:n], 20)]
     subs: list[int] = []
@@ -72,6 +79,8 @@ def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], r
         if affinity.any():
             subs += [int(s) for s in np.argsort(-affinity)[:3] if affinity[s] > 0]
         past = st.bought_before(ui, ts)[0]
+        if past and not block_bought:   # variant m1-rebuy: what they bought before can be recommended again
+            picks.append(np.asarray(past[-60:]))
         if past:   # products bought by people who bought the same things
             pa = np.asarray(past[-30:])
             picks.append(top((st.BB[pa, :n] / st.nb[pa][:, None]).sum(0) / st.nb[:n], 80))
@@ -91,9 +100,11 @@ def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], r
         picks.append(new[np.isin(st.sub[new], subs)][:40])
         picks.append(rng.choice(new, min(15, len(new)), replace=False))
 
+    if __import__("os").environ.get("TWIN_EMBEDDINGS") == "1":
+        picks.append(semantic_candidates(st, rv, ui))
     cand = np.unique(np.concatenate(picks))
     cand = cand[st.ok[cand]]
-    if BLOCK_BOUGHT and past:
+    if block_bought and past:
         cand = cand[~np.isin(cand, past)]
     return cand
 
@@ -109,22 +120,36 @@ def fallback(st: State, exclude: set[int] = frozenset(), k: int = 10) -> list[in
     return out
 
 
-def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator):
-    """Returns (10 product ids, their indices, expected click probability of each slot)."""
+BASE = Variant()
+
+
+def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Variant = BASE, layer=None):
+    """Returns (10 product ids, their indices, expected click probability of each slot,
+    expected purchase probability of each slot, the features of the chosen products at their
+    slots). `v` selects the variant (twin/variants.py); with the default it behaves exactly as
+    the original model."""
     ts = int(req["t"])
     page, dev = PAGES.get(req.get("page"), -1), DEVICES.get(req.get("device"), -1)
     reg = st.region_id.get(req.get("region"), -1)
     ui = st.user(str(req["user_id"]))
     rv = [st.idx[p] for p in (req.get("rv") or []) if p in st.idx]
 
-    cand = candidates(st, ts, dev, reg, ui, rv, rng)
+    cand = candidates(st, ts, dev, reg, ui, rv, rng, v.block_bought)
     if len(cand) < 10:
-        bought = set(st.bought_before(ui, ts)[0]) if BLOCK_BOUGHT else set()
+        bought = set(st.bought_before(ui, ts)[0]) if v.block_bought else set()
         cand = np.unique(np.concatenate([cand, np.asarray(fallback(st, bought, 20), dtype=int)]))
     X = st.featurize(ts, page, dev, reg, ui, rv, cand, 1)
+    if rk.emb is not None:                              # v5-hybrid ranker: append the four hybrid variables
+        X = np.column_stack([X, rk.emb.features(st, rv, ui, cand)])
     p_click, p_buy = rk.predict(X)
-    value = p_click * p_buy * (1 + PRICE_EPS * st.price[cand])
-    mean, sample = st.bandit(cand, rng)
+    p_purchase = p_click * (p_buy if v.buy_power == 1.0 else p_buy ** v.buy_power)
+    value = p_purchase * (1 + v.price_eps * st.price[cand])
+    if not v.bandit:
+        mean = sample = np.ones(len(cand))
+    elif v.live_layer and layer is not None:
+        mean, sample = layer.multipliers(st, cand, rng, ts)
+    else:
+        mean, sample = st.bandit(cand, rng)
     exploit, explore = value * mean, value * sample
 
     chosen: list[int] = []
@@ -142,17 +167,24 @@ def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator):
             taken.add(int(j))
             per_sub[s] = per_sub.get(s, 0) + 1
 
-    best = np.argsort(-exploit)
-    take(best, EXPLOIT_SLOTS, MAX_PER_SUB)
-    take(np.argsort(-explore), 10, MAX_PER_SUB)
-    take(best, 10, 10)                                  # not enough variety: relax the cap
+    if v.slate == "intent":
+        group = st.sub[cand] if v.intent_level == "sub" else st.cat[cand]
+        chosen = intent_slate(exploit, explore, p_click * p_buy * mean, group, v.exploit_slots, v.lam)
+    else:
+        best = np.argsort(-exploit)
+        take(best, v.exploit_slots, v.max_per_sub)
+        if v.exploit_slots < 10:
+            take(np.argsort(-explore), 10, v.max_per_sub)
+        take(best, 10, 10)                              # not enough variety: relax the cap
 
     items = cand[chosen]
     Xs = X[chosen].copy()
     Xs[:, SLOT] = np.arange(1, len(chosen) + 1)
     expected = rk.click.predict(Xs, num_threads=1)
+    expected_buy = expected * p_buy[chosen]
     if len(items) < 10:                                  # should not happen; keep the answer valid anyway
         extra = np.asarray(fallback(st, set(items.tolist()), 10 - len(items)), dtype=int)
         items = np.concatenate([items, extra])
         expected = np.concatenate([expected, np.zeros(len(extra))])
-    return [st.pid[i] for i in items], items, expected
+        expected_buy = np.concatenate([expected_buy, np.zeros(len(extra))])
+    return [st.pid[i] for i in items], items, expected, expected_buy, Xs

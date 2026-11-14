@@ -7,6 +7,12 @@ Settings (environment variables):
     TWIN_VERSION   model_version written with each answer        (default twin-v1)
     TWIN_HOLDOUT   share of requests answered with the baseline, to measure the model's lift live
                    (default 0 = none; use e.g. 0.1 during practice, never during the final)
+    TWIN_ARMS      model variants to compare on live traffic, e.g. "twin-v1:60,noexp:20,price0:20"
+                   (see twin/variants.py; default: one arm, the base model, named TWIN_VERSION)
+
+To change the arms or the holdout WITHOUT restarting, write them in config/twin_arms.txt: the loop
+re-reads it every 15 seconds and it takes precedence over the two variables above.
+Every answer's features are saved to artifacts/declog/ (twin/declog.py) for `python -m twin.train_feedback`.
 
 The main thread only answers requests. Background threads download the organic events, the
 catalogue updates and our feedback; the main thread applies them between two batches, so the
@@ -27,15 +33,17 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
 
+from twin.declog import DecLog
 from twin.recommend import Ranker, fallback, recommend
-from twin.rt import API, TEAM
-from twin.state import State
+from twin.rt import API, ARTIFACTS, TEAM
+from twin.state import NF, State
+from twin.variants import ARMS_FILE, LiveLayer, arms_from_env, parse_arms, pick_arm, read_arms_file
 
 VERSION = os.environ.get("TWIN_VERSION", "twin-v1")
 HOLDOUT = float(os.environ.get("TWIN_HOLDOUT", "0"))
 POLL = 0.25            # seconds between two reads of shop.requests
 OVERLAP_MS = 1500      # re-read this much behind the newest request seen: rows can land out of order
-TOO_OLD_MS = 4000      # a request this old has already been served by the fallback
+TOO_OLD_MS = 2200      # a request this old has already been served by the fallback
 
 REQUESTS = """
 SELECT request_id::String AS request_id, toUnixTimestamp64Milli(ts::DateTime64(3)) AS t, user_id::String AS user_id,
@@ -160,28 +168,68 @@ def restore(st: State, http: requests.Session) -> None:
 
 def main(dry: bool, seconds: float = 0) -> None:
     t0 = time.time()
-    st, rk, rng = State("live"), Ranker(), np.random.default_rng()
+    st, rng = State("live"), np.random.default_rng()
+    if os.environ.get("TWIN_EMBEDDINGS") == "1":
+        from twin.embeddings import semantic_candidates
+        semantic_candidates(st, [], -1)  # fit before reading requests
+    arms = arms_from_env(VERSION)
+    holdout = HOLDOUT
+    rankers = {m: Ranker(ARTIFACTS / m) for m in {v.model for v, _ in arms}}     # one ranker per model folder
+    layer = LiveLayer(st)                                                        # fed by every arm, used by m3-live
+    declog = DecLog(NF)
+    arms_stamp, arms_checked = None, 0.0
+
+    def reload_arms():
+        """config/twin_arms.txt changed: switch arms (and holdout) without restarting. A file that
+        cannot be used leaves everything as it was."""
+        nonlocal arms, holdout, arms_stamp
+        try:
+            stamp = ARMS_FILE.stat().st_mtime_ns
+        except OSError:
+            return
+        if stamp == arms_stamp:
+            return
+        arms_stamp = stamp
+        try:
+            spec, new_holdout = read_arms_file()
+            new = parse_arms(spec, VERSION, strict=True) if spec else None
+            if not new:
+                print("config/twin_arms.txt has no usable arm: keeping the current ones")
+                return
+            for m in {v.model for v, _ in new} - set(rankers):
+                rankers[m] = Ranker(ARTIFACTS / m)             # a model folder seen for the first time
+            arms = new
+            if new_holdout is not None:
+                holdout = new_holdout
+            print(f"{time.strftime('%H:%M:%S')} arms now: " + ", ".join(f"{v.name} {100 * w:.0f}%" for v, w in arms)
+                  + f" | holdout {holdout:.0%}", flush=True)
+        except Exception as e:
+            print(f"config/twin_arms.txt ignored ({type(e).__name__}: {str(e)[:120]}): keeping the current arms")
+
+    reload_arms()
     print(f"state loaded in {time.time() - t0:.0f}s: {st.P} products ({int(st.is_new.sum())} new), {len(st.uidx)} users")
+    print("arms: " + ", ".join(f"{v.name} {100 * w:.0f}%" for v, w in arms))
     http = new_http()
     restore(st, http)
     offset = int(sql(http, "SELECT toUnixTimestamp64Milli(now64(3)) AS t")[0]["t"]) - int(time.time() * 1000)
     now = lambda: int(time.time() * 1000) + offset          # the organisers' clock
-    print(f"server clock offset {offset} ms | version {VERSION} | holdout {HOLDOUT:.0%} | {'DRY RUN' if dry else 'LIVE'}")
+    print(f"server clock offset {offset} ms | version {VERSION} | holdout {holdout:.0%} | {'DRY RUN' if dry else 'LIVE'}")
 
     inbox: queue.Queue = queue.Queue()
     feeds = [Feed("events", EVENTS, st.cutoff_ms, 3.0, 20000, inbox),
              Feed("catalog", CATALOG, st.catalog_cursor, 0.7, 2000, inbox),
              Feed("feedback", FEEDBACK, now() - 60_000, 3.0, 5000, inbox)]
     writer = Writer()
-    for th in (*feeds, writer):
+    for th in (*feeds, writer, declog):
         th.start()
 
-    pending: OrderedDict[str, tuple] = OrderedDict()        # request -> (items, expected clicks, user)
+    pending: OrderedDict[str, tuple] = OrderedDict()        # request -> (items, expected clicks, user, expected purchases)
     seen: OrderedDict[str, None] = OrderedDict()
     cursor = now() - OVERLAP_MS
     fb = fallback(st)
     count = {"answered": 0, "holdout": 0, "errors": 0, "too_old": 0, "pull_errors": 0, "push_errors": 0,
-             "events": 0, "feedback": 0}
+             "events": 0, "feedback": 0, "apply_errors": 0}
+    per_arm: dict[str, int] = {}
     ages: list[int] = []
     timing: dict[str, list[float]] = {"pull": [], "score": [], "push": []}
     last_refresh = last_report = time.time()
@@ -195,27 +243,59 @@ def main(dry: bool, seconds: float = 0) -> None:
                 name, rows = inbox.get_nowait()
             except queue.Empty:
                 break
+            # One bad row (an unexpected value, a product beyond the reserved capacity...) must never
+            # stop the loop: the row is skipped and counted.
             if name == "events":
                 for r in rows:
-                    st.apply_event(int(r["t"]), r["et"], r["u"], r["s"], r["p"], float(r["price"] or 0), r["device"], r["region"])
+                    try:
+                        st.apply_event(int(r["t"]), r["et"], r["u"], r["s"], r["p"], float(r["price"] or 0), r["device"], r["region"])
+                    except Exception as e:
+                        count["apply_errors"] += 1
+                        if count["apply_errors"] <= 10:
+                            print(f"event skipped: {type(e).__name__}: {str(e)[:100]}")
+                try:
+                    layer.events(st, rows)
+                except Exception as e:
+                    count["apply_errors"] += 1
+                    print(f"trend update failed: {type(e).__name__}: {str(e)[:100]}")
                 count["events"] += len(rows)
             elif name == "catalog":
                 for r in rows:
-                    st.apply_catalog_update(r)
+                    try:
+                        i = st.idx.get(str(r.get("product_id")))
+                        old_price = float(st.price[i]) if i is not None else 0.0
+                        st.apply_catalog_update(r)
+                        if i is not None:
+                            layer.price_change(i, old_price, float(st.price[i]), int(r["t"]))
+                    except Exception as e:
+                        count["apply_errors"] += 1
+                        if count["apply_errors"] <= 10:
+                            print(f"catalogue update skipped: {type(e).__name__}: {str(e)[:100]}")
                 fb = fallback(st)
             else:
                 for r in rows:
                     rec = pending.pop(r["request_id"], None)
                     if rec is None:
                         continue
-                    items, expected, ui = rec
-                    bought = st.idx.get(r["purchased"]) if r["purchased"] else None
-                    if bought is not None:
-                        st.mark_bought(ui, bought, int(r["t"]))
-                    if items is not None and r["served_by"] == "team":
-                        clicked = st.idx.get(r["clicked"], -1) if r["clicked"] else -1
-                        st.bandit_update(items, expected, clicked if clicked in items else -1)
-                        count["feedback"] += 1
+                    try:
+                        items, expected, ui, expected_buy = rec
+                        bought = st.idx.get(r["purchased"]) if r["purchased"] else None
+                        if bought is not None:
+                            st.mark_bought(ui, bought, int(r["t"]))
+                        if items is not None and r["served_by"] == "team":
+                            clicked = st.idx.get(r["clicked"], -1) if r["clicked"] else -1
+                            clicked = clicked if clicked in items else -1
+                            st.bandit_update(items, expected, clicked)
+                            layer.feedback(st, items, expected, expected_buy, clicked,
+                                           bought if bought is not None and bought in items else -1, int(r["t"]))
+                            count["feedback"] += 1
+                    except Exception as e:
+                        count["apply_errors"] += 1
+                        if count["apply_errors"] <= 10:
+                            print(f"feedback row skipped: {type(e).__name__}: {str(e)[:100]}")
+        if time.time() - arms_checked > 15:
+            arms_checked = time.time()
+            reload_arms()
         if time.time() - last_refresh > 60:
             st.refresh()
             fb = fallback(st)
@@ -224,7 +304,7 @@ def main(dry: bool, seconds: float = 0) -> None:
         # ---- 2. new requests ---------------------------------------------------------------
         try:
             t_pull = time.time()
-            rows = bounded(4, sql, http, REQUESTS.format(cursor=cursor - OVERLAP_MS))
+            rows = bounded(1.2, sql, http, REQUESTS.format(cursor=cursor - OVERLAP_MS), timeout=(0.4, 0.7))
             timing["pull"].append(time.time() - t_pull)
         except Exception as e:
             count["pull_errors"] += 1
@@ -245,18 +325,22 @@ def main(dry: bool, seconds: float = 0) -> None:
                 continue
             ui = st.user(r["user_id"])
             try:
-                if HOLDOUT and zlib.crc32(rid.encode()) % 1000 < HOLDOUT * 1000:
+                if holdout and zlib.crc32(rid.encode()) % 1000 < holdout * 1000:
                     ids, version = [st.pid[i] for i in fb], "baseline-holdout"
-                    pending[rid] = (None, None, ui)
+                    pending[rid] = (None, None, ui, None)
                     count["holdout"] += 1
                 else:
                     t_score = time.time()
-                    ids, items, expected = recommend(st, rk, r, rng)
+                    arm = pick_arm(arms, rid)
+                    ids, items, expected, expected_buy, Xs = recommend(st, rankers[arm.model], r, rng, arm, layer)
                     timing["score"].append(time.time() - t_score)
                     if len(set(ids)) != 10 or not st.ok[items].all():
                         raise ValueError("invalid slate")
-                    version = VERSION
-                    pending[rid] = (items, expected, ui)
+                    version = arm.name
+                    per_arm[version] = per_arm.get(version, 0) + 1
+                    pending[rid] = (items, expected, ui, expected_buy)
+                    if not dry:
+                        declog.add(rid, int(r["t"]), version, ids, Xs, expected, expected_buy)
                     logs.append({"kind": "twin_pred", "request_id": rid, "t": int(r["t"]), "model_version": version,
                                  "items": ids, "expected": [round(float(e), 5) for e in expected]})
                     if dry and shown_example < 5:
@@ -277,11 +361,16 @@ def main(dry: bool, seconds: float = 0) -> None:
 
         # ---- 3. send -------------------------------------------------------------------------
         if answers and not dry:
-            for attempt in (1, 2):
+            sent_ok = False
+            for attempt in (1,):
                 try:
                     t_push = time.time()
-                    bounded(4, http.post, f"{API}/v1/tables/submissions", params={"database": TEAM}, json=answers,
-                            timeout=(2, 3)).raise_for_status()
+                    # 0.4 s was too tight: a push takes ~0.33 s on average, so ~5 % timed out and some
+                    # of those answers never counted (96 % answered in one 10-minute slot). 1.2 s still
+                    # lands well inside the 3-second deadline (answers leave ~0.7 s after the request).
+                    bounded(1.5, http.post, f"{API}/v1/tables/submissions", params={"database": TEAM}, json=answers,
+                            timeout=(0.5, 1.2)).raise_for_status()
+                    sent_ok = True
                     timing["push"].append(time.time() - t_push)
                     break
                 except Exception as e:
@@ -290,14 +379,19 @@ def main(dry: bool, seconds: float = 0) -> None:
                     http = new_http()
             for rec in logs:
                 writer.q.put(rec)
-        count["answered"] += len(answers)
+        count["answered"] += len(answers) if dry or not answers or sent_ok else 0
 
         if time.time() - last_report > 30:
             a = np.asarray(ages[-2000:]) if ages else np.zeros(1)
             print(f"{time.strftime('%H:%M:%S')} answered {count['answered']} (holdout {count['holdout']}, errors {count['errors']}, "
                   f"too old {count['too_old']}) | age at send p50 {np.median(a):.0f} ms, p95 {np.percentile(a, 95):.0f} ms | "
                   f"pull/push errors {count['pull_errors']}/{count['push_errors']} | events {count['events']}, "
-                  f"feedback {count['feedback']}, backlog {inbox.qsize()} | products {st.P}", flush=True)
+                  f"feedback {count['feedback']}, backlog {inbox.qsize()} | products {st.P}"
+                  + (f" | skipped rows {count['apply_errors']}" if count["apply_errors"] else ""), flush=True)
+            if len(per_arm) > 1:
+                print("         arms: " + ", ".join(f"{k} {n}" for k, n in per_arm.items()), flush=True)
+            if declog.errors:
+                print(f"         decision log: {declog.rows} rows, {declog.errors} write errors", flush=True)
             print("         " + " | ".join(f"{k} avg {1000 * np.mean(v):.0f} ms, max {1000 * np.max(v):.0f} ms"
                                            for k, v in timing.items() if v), flush=True)
             timing = {k: [] for k in timing}
