@@ -1,4 +1,10 @@
 .env
 __pycache__/
 .ipynb_checkpoints/
+
 .venv/
+
+# downloaded snapshots are large and can be rebuilt (python -m twin.build ...); the trained model is kept
+artifacts/*
+!artifacts/model/
+
