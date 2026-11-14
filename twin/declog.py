@@ -42,7 +42,7 @@ class DecLog(threading.Thread):
         x = np.zeros((10, self.F), np.float32)
         ec, eb = np.zeros(10, np.float32), np.zeros(10, np.float32)
         k = min(len(X), 10)
-        x[:k], ec[:k], eb[:k] = X[:k], exp_click[:k], exp_buy[:k]
+        x[:k], ec[:k], eb[:k] = X[:k, :self.F], exp_click[:k], exp_buy[:k]   # a v5 ranker has 4 more columns
         with self.lock:
             hour = int(t) // HOUR_MS
             self.hours.setdefault(hour, []).append((rid, int(t), arm, list(pids), x, ec, eb))

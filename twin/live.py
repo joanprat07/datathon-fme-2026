@@ -365,8 +365,11 @@ def main(dry: bool, seconds: float = 0) -> None:
             for attempt in (1,):
                 try:
                     t_push = time.time()
-                    bounded(0.7, http.post, f"{API}/v1/tables/submissions", params={"database": TEAM}, json=answers,
-                            timeout=(0.2, 0.4)).raise_for_status()
+                    # 0.4 s was too tight: a push takes ~0.33 s on average, so ~5 % timed out and some
+                    # of those answers never counted (96 % answered in one 10-minute slot). 1.2 s still
+                    # lands well inside the 3-second deadline (answers leave ~0.7 s after the request).
+                    bounded(1.5, http.post, f"{API}/v1/tables/submissions", params={"database": TEAM}, json=answers,
+                            timeout=(0.5, 1.2)).raise_for_status()
                     sent_ok = True
                     timing["push"].append(time.time() - t_push)
                     break
