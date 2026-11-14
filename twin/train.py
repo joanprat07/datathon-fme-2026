@@ -22,14 +22,14 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss, roc_auc_score
 
-from twin.build import VALID_START
+from twin.build import VALID_START, SESSION_KEEP
 from twin.rt import ARTIFACTS
 from twin.state import C0, CATEGORICAL, DEVICES, FEATURES, PAGES, State, to_ms
 
 KEEP_NO_CLICK = 0.3   # share of sessions without a click kept for training (weighted back)
 ANON_SHARE = 0.25     # share of training sessions repeated with the shopper's profile hidden
 MODEL_DIR = ARTIFACTS / "model"
-CACHE = ARTIFACTS / "train" / "matrix.npz"
+CACHE = ARTIFACTS / "train" / "matrix_v3.npz"
 SLOT = C0 + 3
 BOUGHT = FEATURES.index("u_p_buys")
 
@@ -41,7 +41,7 @@ def build_matrix(st: State) -> dict[str, np.ndarray]:
     valid = (s.ts >= to_ms(VALID_START)).to_numpy()
     keep = clicked | valid | (rng.random(len(s)) < KEEP_NO_CLICK)   # validation is kept whole
     s = s[keep].reset_index(drop=True)
-    weight = np.where((s.clicked != "") | (s.ts >= to_ms(VALID_START)), 1.0, 1.0 / KEEP_NO_CLICK)
+    weight = np.where(s.clicked != "", 1.0, np.where(s.ts >= to_ms(VALID_START), SESSION_KEEP, SESSION_KEEP / KEEP_NO_CLICK))
     n = len(s)
     # Cold start: some sessions are repeated as if we knew nothing about the shopper, so the
     # ranker also learns to rank from the session and the products alone. In training that is
@@ -150,12 +150,12 @@ def main(refit: bool, keep_bought: bool = False, out: str = "model") -> None:
     slot_rate = pd.Series(click[tr]).groupby(X[tr][:, SLOT]).mean()   # position-only reference
     ref = pd.Series(Xv[:, SLOT]).map(slot_rate).to_numpy()
     metrics = {
-        "click_auc": roc_auc_score(click[va], pc),
-        "click_auc_position_only": roc_auc_score(click[va], ref),
-        "click_logloss": log_loss(click[va], pc),
-        "click_logloss_position_only": log_loss(click[va], ref),
+        "click_auc": roc_auc_score(click[va], pc, sample_weight=w[va]),
+        "click_auc_position_only": roc_auc_score(click[va], ref, sample_weight=w[va]),
+        "click_logloss": log_loss(click[va], pc, sample_weight=w[va]),
+        "click_logloss_position_only": log_loss(click[va], ref, sample_weight=w[va]),
         "buy_given_click_auc": roc_auc_score(buy[cva], buy_model.predict(X[cva])),
-        "purchase_auc": roc_auc_score(buy[va], pc * pb),
+        "purchase_auc": roc_auc_score(buy[va], pc * pb, sample_weight=w[va]),
         "mrr_clicked_model": mrr(score, click[va_all]),
         "mrr_clicked_model_cold": mrr(score_cold, click[cold_all]),
         "mrr_clicked_popularity": mrr(popularity, click[va_all]),
@@ -168,7 +168,7 @@ def main(refit: bool, keep_bought: bool = False, out: str = "model") -> None:
         "top1_bought_popularity": top1(popularity, buy[va_all]),
         "rows_left_out_already_bought": int(bought.sum()),
         "keep_bought": keep_bought, **repeat,
-        "calibration_click": float(pc.mean() / click[va].mean()),
+        "calibration_click": float(np.average(pc, weights=w[va]) / np.average(click[va], weights=w[va])),
         "click_rounds": click_model.best_iteration, "buy_rounds": buy_model.best_iteration,
         "valid_from": VALID_START,
     }

@@ -1,10 +1,26 @@
 """Model variants that can run side by side in the live loop, to compare them on real traffic.
 
-    TWIN_ARMS="twin-v1:60,m1-rebuy:20,m2-intent:10,m3-live:10" python -m twin.live
+    TWIN_ARMS="twin-v1:60,noexp:20,price0:20" python -m twin.live
 
 Each arm is one `Variant`. A request is assigned to an arm by a stable hash of its request_id and
-the arm's name is written as `model_version`, so `python -m twin.monitor` compares them directly.
-Without TWIN_ARMS the loop runs exactly as before (one arm, the base model).
+the arm's name is written as `model_version`, so the leaderboard (Beta view, open the team row)
+shows each one's conversion. Without arms the loop runs exactly as before (one arm, the base model).
+
+Arms can be changed WITHOUT restarting: write them in config/twin_arms.txt (one "name: share" per
+line); the loop re-reads the file every 15 seconds. A restart costs minutes of fallback answers.
+
+Single-setting variants, to find out one by one what helps (join with '+' to combine winners, and
+give the combination its own name with '=':  "twin-v2=noexp+price0: 50"):
+
+    noexp       no exploration: all 10 slots by expected value (base: slots 8-10 are sampled)
+    price0      no preference for expensive products (base tilts the score up to ~10% by price)
+    cap3 cap4 cap7   at most N products per subcategory (base: 5)
+    nobandit    no correction from our own feedback
+    buy15 buy07 weight of p(purchase | click) in the score (base: 1)
+    fb          the ranker retrained with our own feedback (python -m twin.train_feedback)
+
+Tested live on Sat 14 Nov 19:05-19:20: "m2-intent+m3-live" converted 1.44% against 1.60% for the
+base model on the same minutes (about 1,000 requests). Not recommended; kept for reference.
 
 The three variants change one thing each, so the comparison says which idea works:
 
@@ -43,20 +59,38 @@ class Variant:
     intent_level: str = "cat"     # "cat" or "sub": what counts as one intent
     lam: float = 1.0              # strength of the intent effect (0 = plain sort)
     live_layer: bool = False      # use LiveLayer multipliers instead of the base bandit
+    exploit_slots: int = 7        # slots filled by expected value; the rest are Thompson samples (10 = no exploration)
+    max_per_sub: int = 5          # at most this many products of one subcategory
+    bandit: bool = True           # correct the score with observed/expected clicks of our own carousels
+    buy_power: float = 1.0        # score = p_click * p_buy ** buy_power
+    price_eps: float = 0.0005     # score *= 1 + price_eps * price (revenue is only the tie-breaker)
 
 
 VARIANTS = {
     "m1-rebuy": Variant("m1-rebuy", model="model_rebuy", block_bought=False),
     "m2-intent": Variant("m2-intent", slate="intent"),
     "m3-live": Variant("m3-live", live_layer=True),
+    "noexp": Variant("noexp", exploit_slots=10),
+    "price0": Variant("price0", price_eps=0.0),
+    "cap3": Variant("cap3", max_per_sub=3),
+    "cap4": Variant("cap4", max_per_sub=4),
+    "cap7": Variant("cap7", max_per_sub=7),
+    "nobandit": Variant("nobandit", bandit=False),
+    "buy15": Variant("buy15", buy_power=1.5),
+    "buy07": Variant("buy07", buy_power=0.7),
+    "fb": Variant("fb", model="model_fb"),
 }
+ARMS_FILE = ARTIFACTS.parent / "config" / "twin_arms.txt"
 
 
 def get_variant(name: str) -> Variant:
-    """A registered variant, a combination joined with '+' ('m1-rebuy+m3-live': both changes at once),
+    """A registered variant, a combination joined with '+' ('noexp+price0': both changes at once),
+    'label=recipe' to run a recipe under a name of our choice ('twin-v2=noexp+price0'),
     or, for any other name, the base model under that name."""
-    v, base = Variant(name), Variant()
-    for part in name.split("+"):
+    label, _, recipe = name.partition("=")
+    v, base = Variant(label.strip()), Variant()
+    for part in (recipe or label).split("+"):
+        part = part.strip()
         known = VARIANTS.get(part)
         if known is not None:   # take every setting this variant changes
             changed = {f: getattr(known, f) for f in base.__dataclass_fields__ if f != "name" and getattr(known, f) != getattr(base, f)}
@@ -64,19 +98,25 @@ def get_variant(name: str) -> Variant:
     return v
 
 
-def parse_arms(spec: str, default_name: str) -> list[tuple[Variant, float]]:
+def parse_arms(spec: str, default_name: str, strict: bool = False) -> list[tuple[Variant, float]]:
     """'twin-v1:60,m1-rebuy:20' -> [(Variant, share)]. Unknown names run the base model under that name.
     Arms whose model folder does not exist are dropped (their traffic goes to the others)."""
     arms: list[tuple[Variant, float]] = []
     for part in [p for p in spec.split(",") if p.strip()]:
-        name, _, weight = part.strip().partition(":")
-        v = get_variant(name)
-        if not (ARTIFACTS / v.model / "meta.json").exists():
-            print(f"arm '{name}' skipped: artifacts/{v.model}/ does not exist")
+        name, _, weight = part.strip().rpartition(":") if ":" in part else (part.strip(), "", "1")
+        try:
+            v, w = get_variant(name.strip()), float(weight)
+        except Exception as e:
+            print(f"arm '{part.strip()}' skipped: {type(e).__name__}: {e}")
             continue
-        if float(weight or 1) > 0:
-            arms.append((v, float(weight or 1)))
+        if not (ARTIFACTS / v.model / "meta.json").exists():
+            print(f"arm '{v.name}' skipped: artifacts/{v.model}/ does not exist")
+            continue
+        if w > 0:
+            arms.append((v, w))
     if not arms:
+        if strict:      # the caller keeps what it had
+            return []
         arms = [(Variant(default_name), 1.0)]
     total = sum(w for _, w in arms)
     return [(v, w / total) for v, w in arms]
@@ -98,6 +138,36 @@ def pick_arm(arms: list[tuple[Variant, float]], request_id: str) -> Variant:
 def arms_from_env(default_name: str) -> list[tuple[Variant, float]]:
     spec = os.environ.get("TWIN_ARMS", "")
     return parse_arms(spec, default_name) if spec else [(replace(Variant(), name=default_name), 1.0)]
+
+
+def read_arms_file(path=None) -> tuple[str, float | None] | None:
+    """config/twin_arms.txt -> (arms spec, holdout share or None). None if there is no file.
+
+        # comments and blank lines are ignored
+        twin-v1: 60
+        noexp: 20
+        twin-v2=noexp+price0: 20
+        holdout: 5          # percent of requests answered with the baseline on purpose (optional)
+    """
+    path = path or ARMS_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    parts, holdout = [], None
+    for line in text.replace(",", "\n").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, _, weight = line.rpartition(":") if ":" in line else (line, "", "1")
+        if name.strip().lower() == "holdout":
+            try:
+                holdout = min(max(float(weight) / 100.0, 0.0), 0.5)
+            except ValueError:
+                pass
+        else:
+            parts.append(f"{name.strip()}:{weight.strip()}")
+    return ",".join(parts), holdout
 
 
 # ------------------------------------------------------------------------------------ m2: slate by intent
