@@ -26,6 +26,7 @@ from twin.rt import ARTIFACTS
 from twin.state import C0, DEVICES, FEATURES, PAGES, State
 from twin.variants import Variant, intent_slate
 from twin.embeddings import semantic_candidates
+from twin.hybrid_live import EMB_FILE, EXTRA, Embeddings
 
 SLOT = C0 + 3
 EXPLOIT_SLOTS = 7      # slots filled by expected value; the rest explore
@@ -37,7 +38,10 @@ BLOCK_BOUGHT = True    # business rule: never recommend a product the shopper al
 class Ranker:
     def __init__(self, path=ARTIFACTS / "model"):
         meta = json.loads((path / "meta.json").read_text())
-        if meta["features"] != FEATURES:
+        self.emb = None
+        if meta["features"] == FEATURES + EXTRA:       # v5-hybrid: four more columns from twin/hybrid_live.py
+            self.emb = Embeddings(path / EMB_FILE)
+        elif meta["features"] != FEATURES:
             raise RuntimeError("the saved model was trained with a different feature list: run `python -m twin.train --refit`")
         self.click = lgb.Booster(model_file=str(path / "click.txt"))
         self.buy = lgb.Booster(model_file=str(path / "buy.txt"))
@@ -135,6 +139,8 @@ def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Var
         bought = set(st.bought_before(ui, ts)[0]) if v.block_bought else set()
         cand = np.unique(np.concatenate([cand, np.asarray(fallback(st, bought, 20), dtype=int)]))
     X = st.featurize(ts, page, dev, reg, ui, rv, cand, 1)
+    if rk.emb is not None:                              # v5-hybrid ranker: append the four hybrid variables
+        X = np.column_stack([X, rk.emb.features(st, rv, ui, cand)])
     p_click, p_buy = rk.predict(X)
     p_purchase = p_click * (p_buy if v.buy_power == 1.0 else p_buy ** v.buy_power)
     value = p_purchase * (1 + v.price_eps * st.price[cand])

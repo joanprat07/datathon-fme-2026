@@ -79,6 +79,7 @@ VARIANTS = {
     "buy15": Variant("buy15", buy_power=1.5),
     "buy07": Variant("buy07", buy_power=0.7),
     "fb": Variant("fb", model="model_fb"),
+    "v5-hybrid": Variant("v5-hybrid", model="model_v5"),   # twin-v1 + the 4 hybrid variables (twin/hybrid_live.py)
 }
 ARMS_FILE = ARTIFACTS.parent / "config" / "twin_arms.txt"
 
