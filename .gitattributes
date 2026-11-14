@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# LightGBM model files store byte offsets: their line endings must never be converted
+artifacts/model*/*.txt -text

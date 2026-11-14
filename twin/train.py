@@ -2,6 +2,9 @@
 
     python -m twin.train            # featurize (cached), train, validate, save artifacts/model/
     python -m twin.train --refit    # same, then refit on train + validation for the live model
+    python -m twin.train --keep-bought --out model_rebuy --refit
+                                    # variant m1-rebuy: already-bought products stay in training, so the
+                                    # ranker learns from the log what a past purchase means; saved apart
 
 Two LightGBM models, multiplied at serving time:
     p(click | product, slot, shopper, session)   x   p(purchase | click, ...)
@@ -101,7 +104,8 @@ def top1(score: np.ndarray, click: np.ndarray) -> float:
     return float(c[has][np.arange(has.sum()), s[has].argmax(1)].mean())
 
 
-def main(refit: bool) -> None:
+def main(refit: bool, keep_bought: bool = False, out: str = "model") -> None:
+    model_dir = ARTIFACTS / out
     if CACHE.exists():
         m = dict(np.load(CACHE))
         print("loaded cached feature matrix", m["X"].shape)
@@ -113,7 +117,14 @@ def main(refit: bool) -> None:
     # Business rule: we never recommend a product the shopper already bought. Those rows are
     # left out of training and validation, so the ranker does not learn the repurchase pattern
     # of the old carousel's log; they also never win in the ranking metrics below.
-    bought = X[:, BOUGHT] > 0
+    was_bought = X[:, BOUGHT] > 0
+    # How much of what the old carousel sold is a repurchase? This is what the rule gives up.
+    repeat = {"repurchase_share_of_purchases": float(buy[va_all & was_bought].sum() / max(buy[va_all].sum(), 1)),
+              "repurchase_share_of_clicks": float(click[va_all & was_bought].sum() / max(click[va_all].sum(), 1)),
+              "already_bought_share_of_rows": float(was_bought[va_all].mean())}
+    print("already-bought products in validation: " + ", ".join(f"{k} {100 * v:.1f}%" for k, v in repeat.items()))
+    # --keep-bought: nothing is left out; the ranker sees u_p_buys / u_p_buy_days and decides.
+    bought = was_bought & (not keep_bought)
     click, buy = np.where(bought, 0, click).astype(np.int8), np.where(bought, 0, buy).astype(np.int8)
     tr, va, cold = ~late & ~bought, va_all & ~bought, cold_all & ~bought   # cold: shopper hidden
     print(f"left out {bought.sum():,} rows of already-bought products ({100 * bought.mean():.1f}%)")
@@ -156,10 +167,15 @@ def main(refit: bool) -> None:
         "top1_bought_model_cold": top1(score_cold, buy[cold_all]),
         "top1_bought_popularity": top1(popularity, buy[va_all]),
         "rows_left_out_already_bought": int(bought.sum()),
+        "keep_bought": keep_bought, **repeat,
         "calibration_click": float(pc.mean() / click[va].mean()),
         "click_rounds": click_model.best_iteration, "buy_rounds": buy_model.best_iteration,
         "valid_from": VALID_START,
     }
+    if keep_bought:   # the same ranker with the blocking rule applied on top: what the rule costs offline
+        blocked = np.where(was_bought[va_all], -1.0, score)
+        metrics["top1_bought_model_if_blocked"] = top1(blocked, buy[va_all])
+        metrics["mrr_bought_model_if_blocked"] = mrr(blocked, buy[va_all])
     for k, v in metrics.items():
         print(f"  {k:32s} {v:.4f}" if isinstance(v, float) else f"  {k:32s} {v}")
     gain = pd.Series(click_model.feature_importance("gain"), FEATURES).sort_values(ascending=False)
@@ -177,13 +193,14 @@ def main(refit: bool) -> None:
                         rounds=int(buy_model.best_iteration * 1.1))
         metrics["refit_on_all_days"] = True
 
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    click_model.save_model(str(MODEL_DIR / "click.txt"))
-    buy_model.save_model(str(MODEL_DIR / "buy.txt"))
-    (MODEL_DIR / "meta.json").write_text(json.dumps({"features": FEATURES, "metrics": metrics,
+    model_dir.mkdir(parents=True, exist_ok=True)
+    click_model.save_model(str(model_dir / "click.txt"))
+    buy_model.save_model(str(model_dir / "buy.txt"))
+    (model_dir / "meta.json").write_text(json.dumps({"features": FEATURES, "metrics": metrics,
                                                      "importance": (gain / gain.sum()).round(4).to_dict()}, indent=1))
-    print(f"saved to {MODEL_DIR}")
+    print(f"saved to {model_dir}")
 
 
 if __name__ == "__main__":
-    main("--refit" in sys.argv)
+    main("--refit" in sys.argv, "--keep-bought" in sys.argv,
+         sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else "model")
