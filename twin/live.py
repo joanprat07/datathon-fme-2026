@@ -7,6 +7,8 @@ Settings (environment variables):
     TWIN_VERSION   model_version written with each answer        (default twin-v1)
     TWIN_HOLDOUT   share of requests answered with the baseline, to measure the model's lift live
                    (default 0 = none; use e.g. 0.1 during practice, never during the final)
+    TWIN_ARMS      model variants to compare on live traffic, e.g. "twin-v1:60,m1-rebuy:20,m2-intent:10,m3-live:10"
+                   (see twin/variants.py; default: one arm, the base model, named TWIN_VERSION)
 
 The main thread only answers requests. Background threads download the organic events, the
 catalogue updates and our feedback; the main thread applies them between two batches, so the
@@ -28,8 +30,9 @@ import numpy as np
 import requests
 
 from twin.recommend import Ranker, fallback, recommend
-from twin.rt import API, TEAM
+from twin.rt import API, ARTIFACTS, TEAM
 from twin.state import State
+from twin.variants import LiveLayer, arms_from_env, pick_arm
 
 VERSION = os.environ.get("TWIN_VERSION", "twin-v1")
 HOLDOUT = float(os.environ.get("TWIN_HOLDOUT", "0"))
@@ -160,8 +163,12 @@ def restore(st: State, http: requests.Session) -> None:
 
 def main(dry: bool, seconds: float = 0) -> None:
     t0 = time.time()
-    st, rk, rng = State("live"), Ranker(), np.random.default_rng()
+    st, rng = State("live"), np.random.default_rng()
+    arms = arms_from_env(VERSION)
+    rankers = {m: Ranker(ARTIFACTS / m) for m in {v.model for v, _ in arms}}     # one ranker per model folder
+    layer = LiveLayer(st)                                                        # fed by every arm, used by m3-live
     print(f"state loaded in {time.time() - t0:.0f}s: {st.P} products ({int(st.is_new.sum())} new), {len(st.uidx)} users")
+    print("arms: " + ", ".join(f"{v.name} {100 * w:.0f}%" for v, w in arms))
     http = new_http()
     restore(st, http)
     offset = int(sql(http, "SELECT toUnixTimestamp64Milli(now64(3)) AS t")[0]["t"]) - int(time.time() * 1000)
@@ -176,12 +183,13 @@ def main(dry: bool, seconds: float = 0) -> None:
     for th in (*feeds, writer):
         th.start()
 
-    pending: OrderedDict[str, tuple] = OrderedDict()        # request -> (items, expected clicks, user)
+    pending: OrderedDict[str, tuple] = OrderedDict()        # request -> (items, expected clicks, user, expected purchases)
     seen: OrderedDict[str, None] = OrderedDict()
     cursor = now() - OVERLAP_MS
     fb = fallback(st)
     count = {"answered": 0, "holdout": 0, "errors": 0, "too_old": 0, "pull_errors": 0, "push_errors": 0,
-             "events": 0, "feedback": 0}
+             "events": 0, "feedback": 0, "apply_errors": 0}
+    per_arm = {v.name: 0 for v, _ in arms}
     ages: list[int] = []
     timing: dict[str, list[float]] = {"pull": [], "score": [], "push": []}
     last_refresh = last_report = time.time()
@@ -195,27 +203,56 @@ def main(dry: bool, seconds: float = 0) -> None:
                 name, rows = inbox.get_nowait()
             except queue.Empty:
                 break
+            # One bad row (an unexpected value, a product beyond the reserved capacity...) must never
+            # stop the loop: the row is skipped and counted.
             if name == "events":
                 for r in rows:
-                    st.apply_event(int(r["t"]), r["et"], r["u"], r["s"], r["p"], float(r["price"] or 0), r["device"], r["region"])
+                    try:
+                        st.apply_event(int(r["t"]), r["et"], r["u"], r["s"], r["p"], float(r["price"] or 0), r["device"], r["region"])
+                    except Exception as e:
+                        count["apply_errors"] += 1
+                        if count["apply_errors"] <= 10:
+                            print(f"event skipped: {type(e).__name__}: {str(e)[:100]}")
+                try:
+                    layer.events(st, rows)
+                except Exception as e:
+                    count["apply_errors"] += 1
+                    print(f"trend update failed: {type(e).__name__}: {str(e)[:100]}")
                 count["events"] += len(rows)
             elif name == "catalog":
                 for r in rows:
-                    st.apply_catalog_update(r)
+                    try:
+                        i = st.idx.get(str(r.get("product_id")))
+                        old_price = float(st.price[i]) if i is not None else 0.0
+                        st.apply_catalog_update(r)
+                        if i is not None:
+                            layer.price_change(i, old_price, float(st.price[i]), int(r["t"]))
+                    except Exception as e:
+                        count["apply_errors"] += 1
+                        if count["apply_errors"] <= 10:
+                            print(f"catalogue update skipped: {type(e).__name__}: {str(e)[:100]}")
                 fb = fallback(st)
             else:
                 for r in rows:
                     rec = pending.pop(r["request_id"], None)
                     if rec is None:
                         continue
-                    items, expected, ui = rec
-                    bought = st.idx.get(r["purchased"]) if r["purchased"] else None
-                    if bought is not None:
-                        st.mark_bought(ui, bought, int(r["t"]))
-                    if items is not None and r["served_by"] == "team":
-                        clicked = st.idx.get(r["clicked"], -1) if r["clicked"] else -1
-                        st.bandit_update(items, expected, clicked if clicked in items else -1)
-                        count["feedback"] += 1
+                    try:
+                        items, expected, ui, expected_buy = rec
+                        bought = st.idx.get(r["purchased"]) if r["purchased"] else None
+                        if bought is not None:
+                            st.mark_bought(ui, bought, int(r["t"]))
+                        if items is not None and r["served_by"] == "team":
+                            clicked = st.idx.get(r["clicked"], -1) if r["clicked"] else -1
+                            clicked = clicked if clicked in items else -1
+                            st.bandit_update(items, expected, clicked)
+                            layer.feedback(st, items, expected, expected_buy, clicked,
+                                           bought if bought is not None and bought in items else -1, int(r["t"]))
+                            count["feedback"] += 1
+                    except Exception as e:
+                        count["apply_errors"] += 1
+                        if count["apply_errors"] <= 10:
+                            print(f"feedback row skipped: {type(e).__name__}: {str(e)[:100]}")
         if time.time() - last_refresh > 60:
             st.refresh()
             fb = fallback(st)
@@ -247,16 +284,18 @@ def main(dry: bool, seconds: float = 0) -> None:
             try:
                 if HOLDOUT and zlib.crc32(rid.encode()) % 1000 < HOLDOUT * 1000:
                     ids, version = [st.pid[i] for i in fb], "baseline-holdout"
-                    pending[rid] = (None, None, ui)
+                    pending[rid] = (None, None, ui, None)
                     count["holdout"] += 1
                 else:
                     t_score = time.time()
-                    ids, items, expected = recommend(st, rk, r, rng)
+                    arm = pick_arm(arms, rid)
+                    ids, items, expected, expected_buy = recommend(st, rankers[arm.model], r, rng, arm, layer)
                     timing["score"].append(time.time() - t_score)
                     if len(set(ids)) != 10 or not st.ok[items].all():
                         raise ValueError("invalid slate")
-                    version = VERSION
-                    pending[rid] = (items, expected, ui)
+                    version = arm.name
+                    per_arm[version] += 1
+                    pending[rid] = (items, expected, ui, expected_buy)
                     logs.append({"kind": "twin_pred", "request_id": rid, "t": int(r["t"]), "model_version": version,
                                  "items": ids, "expected": [round(float(e), 5) for e in expected]})
                     if dry and shown_example < 5:
@@ -297,7 +336,10 @@ def main(dry: bool, seconds: float = 0) -> None:
             print(f"{time.strftime('%H:%M:%S')} answered {count['answered']} (holdout {count['holdout']}, errors {count['errors']}, "
                   f"too old {count['too_old']}) | age at send p50 {np.median(a):.0f} ms, p95 {np.percentile(a, 95):.0f} ms | "
                   f"pull/push errors {count['pull_errors']}/{count['push_errors']} | events {count['events']}, "
-                  f"feedback {count['feedback']}, backlog {inbox.qsize()} | products {st.P}", flush=True)
+                  f"feedback {count['feedback']}, backlog {inbox.qsize()} | products {st.P}"
+                  + (f" | skipped rows {count['apply_errors']}" if count["apply_errors"] else ""), flush=True)
+            if len(per_arm) > 1:
+                print("         arms: " + ", ".join(f"{k} {n}" for k, n in per_arm.items()), flush=True)
             print("         " + " | ".join(f"{k} avg {1000 * np.mean(v):.0f} ms, max {1000 * np.max(v):.0f} ms"
                                            for k, v in timing.items() if v), flush=True)
             timing = {k: [] for k in timing}

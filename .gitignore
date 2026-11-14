@@ -7,4 +7,5 @@ __pycache__/
 # downloaded snapshots are large and can be rebuilt (python -m twin.build ...); the trained model is kept
 artifacts/*
 !artifacts/model/
+!artifacts/model_rebuy/
 

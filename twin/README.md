@@ -33,6 +33,14 @@ Settings for step 5 (environment variables):
   `baseline-holdout`, to measure the model's lift on live traffic. Use `0.1` during practice and
   **`0` during the final round**.
 
+- `TWIN_ARMS` (default: none): compare model variants on live traffic. Each request goes to one arm by a
+  stable hash and the arm's name is its `model_version`, so step 6 shows them side by side. Example:
+  `TWIN_ARMS="twin-v1:60,m1-rebuy:20,m2-intent:10,m3-live:10"`. Variants are in `variants.py`; join two
+  with `+` to run both changes at once (`m1-rebuy+m3-live`). `m1-rebuy` needs its own model first:
+  `python -m twin.train --keep-bought --out model_rebuy --refit`. Use one arm during the final round.
+
+To restart the loop automatically if it ever stops: `python -m twin.supervisor` instead of step 5.
+
 ## What each file does
 
 | File | Role |
@@ -44,6 +52,8 @@ Settings for step 5 (environment variables):
 | `recommend.py` | Candidates, ranking, bandit, filters: one request in, ten products out |
 | `live.py` | The loop: answers requests, follows events, catalogue updates and feedback in the background |
 | `monitor.py` | Reliability and conversion per model version, from our feedback |
+| `variants.py` | Model variants for live comparison: `m1-rebuy`, `m2-intent`, `m3-live` (see `docs/ANALISI_TWIN.md`) |
+| `supervisor.py` | Starts the live loop and starts it again if it stops |
 
 ## Design choices
 
