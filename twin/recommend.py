@@ -25,6 +25,7 @@ import numpy as np
 from twin.rt import ARTIFACTS
 from twin.state import C0, DEVICES, FEATURES, PAGES, State
 from twin.variants import Variant, intent_slate
+from twin.embeddings import semantic_candidates
 
 SLOT = C0 + 3
 EXPLOIT_SLOTS = 7      # slots filled by expected value; the rest explore
@@ -95,6 +96,8 @@ def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], r
         picks.append(new[np.isin(st.sub[new], subs)][:40])
         picks.append(rng.choice(new, min(15, len(new)), replace=False))
 
+    if __import__("os").environ.get("TWIN_EMBEDDINGS") == "1":
+        picks.append(semantic_candidates(st, rv, ui))
     cand = np.unique(np.concatenate(picks))
     cand = cand[st.ok[cand]]
     if block_bought and past:
@@ -118,8 +121,9 @@ BASE = Variant()
 
 def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Variant = BASE, layer=None):
     """Returns (10 product ids, their indices, expected click probability of each slot,
-    expected purchase probability of each slot). `v` selects the variant (twin/variants.py);
-    with the default it behaves exactly as the original model."""
+    expected purchase probability of each slot, the features of the chosen products at their
+    slots). `v` selects the variant (twin/variants.py); with the default it behaves exactly as
+    the original model."""
     ts = int(req["t"])
     page, dev = PAGES.get(req.get("page"), -1), DEVICES.get(req.get("device"), -1)
     reg = st.region_id.get(req.get("region"), -1)
@@ -132,8 +136,11 @@ def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Var
         cand = np.unique(np.concatenate([cand, np.asarray(fallback(st, bought, 20), dtype=int)]))
     X = st.featurize(ts, page, dev, reg, ui, rv, cand, 1)
     p_click, p_buy = rk.predict(X)
-    value = p_click * p_buy * (1 + PRICE_EPS * st.price[cand])
-    if v.live_layer and layer is not None:
+    p_purchase = p_click * (p_buy if v.buy_power == 1.0 else p_buy ** v.buy_power)
+    value = p_purchase * (1 + v.price_eps * st.price[cand])
+    if not v.bandit:
+        mean = sample = np.ones(len(cand))
+    elif v.live_layer and layer is not None:
         mean, sample = layer.multipliers(st, cand, rng, ts)
     else:
         mean, sample = st.bandit(cand, rng)
@@ -156,11 +163,12 @@ def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Var
 
     if v.slate == "intent":
         group = st.sub[cand] if v.intent_level == "sub" else st.cat[cand]
-        chosen = intent_slate(exploit, explore, p_click * p_buy * mean, group, EXPLOIT_SLOTS, v.lam)
+        chosen = intent_slate(exploit, explore, p_click * p_buy * mean, group, v.exploit_slots, v.lam)
     else:
         best = np.argsort(-exploit)
-        take(best, EXPLOIT_SLOTS, MAX_PER_SUB)
-        take(np.argsort(-explore), 10, MAX_PER_SUB)
+        take(best, v.exploit_slots, v.max_per_sub)
+        if v.exploit_slots < 10:
+            take(np.argsort(-explore), 10, v.max_per_sub)
         take(best, 10, 10)                              # not enough variety: relax the cap
 
     items = cand[chosen]
@@ -173,4 +181,4 @@ def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Var
         items = np.concatenate([items, extra])
         expected = np.concatenate([expected, np.zeros(len(extra))])
         expected_buy = np.concatenate([expected_buy, np.zeros(len(extra))])
-    return [st.pid[i] for i in items], items, expected, expected_buy
+    return [st.pid[i] for i in items], items, expected, expected_buy, Xs

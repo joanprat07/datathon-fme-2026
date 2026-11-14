@@ -17,7 +17,9 @@ import numpy as np  # noqa: E402
 import twin.recommend as R  # noqa: E402
 import twin.rt  # noqa: E402
 import twin.state  # noqa: E402
+import twin.declog  # noqa: E402
 import twin.train  # noqa: E402
+import twin.train_feedback as TF  # noqa: E402
 import twin.variants as V  # noqa: E402
 from tests.twin_synth import make_snapshot  # noqa: E402
 
@@ -25,6 +27,7 @@ REAL_MODEL = twin.rt.ROOT / "artifacts" / "model"
 TMP = Path(tempfile.mkdtemp(prefix="twin-test-"))
 INFO = make_snapshot(TMP / "live", live=True)
 twin.state.ARTIFACTS = TMP
+shutil.copytree(REAL_MODEL, TMP / "model")           # el model real, a la carpeta temporal de les proves
 ST = twin.state.State("live")
 RK = R.Ranker(REAL_MODEL)
 
@@ -43,13 +46,50 @@ def _valid(ids, items) -> None:
 def test_base_and_all_variants_return_valid_slates():
     rng = np.random.default_rng(1)
     layer = V.LiveLayer(ST)
-    for name in (None, "m1-rebuy", "m2-intent", "m3-live"):
-        v = V.VARIANTS[name] if name else R.BASE
-        for k in range(60):
+    for name in [None, *V.VARIANTS, "noexp+price0+cap3", "twin-v2=noexp+price0"]:
+        v = V.get_variant(name) if name else R.BASE
+        for k in range(40):
             req = _req(k, user=f"nou_{k}" if k % 5 == 0 else None, rv=["p_new1", "desconegut"] if k % 7 == 0 else None)
-            ids, items, exp_click, exp_buy = R.recommend(ST, RK, req, rng, v, layer)
+            ids, items, exp_click, exp_buy, Xs = R.recommend(ST, RK, req, rng, v, layer)
             _valid(ids, items)
             assert len(exp_click) == len(exp_buy) == 10 and (exp_buy <= exp_click + 1e-9).all()
+            assert Xs.shape == (10, twin.state.NF) and list(Xs[:, R.SLOT]) == list(range(1, 11))
+
+
+def test_single_setting_variants_do_what_they_say():
+    subs_of = lambda items: np.bincount(ST.sub[items]).max()
+    same = more_than_3 = 0
+    for k in range(60):
+        req = _req(k, rv=[INFO["pid"][(30 * j + k) % 400] for j in range(4)])     # sessió concentrada en una subcategoria
+        a = R.recommend(ST, RK, req, np.random.default_rng(1), V.get_variant("noexp"))[1]
+        b = R.recommend(ST, RK, req, np.random.default_rng(2), V.get_variant("noexp"))[1]
+        assert list(a) == list(b)                                   # sense exploració no hi ha atzar
+        base = R.recommend(ST, RK, req, np.random.default_rng(1), R.BASE)[1]
+        assert list(a[:7]) == list(base[:7])                        # els 7 primers són els mateixos que el model base
+        same += list(a) == list(base)
+        more_than_3 += subs_of(base) > 3
+        assert subs_of(R.recommend(ST, RK, req, np.random.default_rng(1), V.get_variant("cap3"))[1]) <= 3
+        assert subs_of(base) <= 5
+    assert same < 60                                                # i els 3 últims sí que canvien alguna vegada
+    assert more_than_3 > 0                                          # el límit de 3 és una restricció real en aquestes dades
+    v = V.get_variant("twin-v2=noexp+price0")
+    assert v.name == "twin-v2" and v.exploit_slots == 10 and v.price_eps == 0 and v.max_per_sub == 5 and v.bandit
+    assert V.get_variant("fb+noexp").model == "model_fb" and V.get_variant("nobandit").bandit is False
+
+
+def test_arms_file_is_read_without_restart():
+    f = TMP / "twin_arms.txt"
+    f.write_text("# prova\ntwin-v1: 50\n\nnoexp: 25   # sense exploració\ntwin-v2=noexp+price0: 25\nholdout: 5\n", encoding="utf-8")
+    spec, holdout = V.read_arms_file(f)
+    assert holdout == 0.05 and spec == "twin-v1:50,noexp:25,twin-v2=noexp+price0:25"
+    twin.variants.ARTIFACTS = TMP
+    arms = V.parse_arms(spec, "twin-v1")
+    assert [(v.name, round(w, 2)) for v, w in arms] == [("twin-v1", 0.5), ("noexp", 0.25), ("twin-v2", 0.25)]
+    assert V.read_arms_file(TMP / "no-hi-es.txt") is None
+    f.write_text("fb: 30, twin-v1: 70", encoding="utf-8")            # també en una sola línia; fb cau si no hi ha model_fb
+    spec, holdout = V.read_arms_file(f)
+    assert holdout is None and [v.name for v, _ in V.parse_arms(spec, "x")] == ["twin-v1"]
+    assert [v.name for v, _ in V.parse_arms("brossa:abc,twin-v1:1", "x")] == ["twin-v1"]   # un pes il·legible no trenca res
 
 
 def test_m1_rebuy_only_changes_the_blocking_rule():
@@ -60,11 +100,11 @@ def test_m1_rebuy_only_changes_the_blocking_rule():
         bought = set(ST.bought_before(ui, INFO["cut"] + 1000 * k)[0])
         assert bought
         req = _req(k, user=u)
-        _, items, _, _ = R.recommend(ST, RK, req, np.random.default_rng(k), R.BASE)
+        items = R.recommend(ST, RK, req, np.random.default_rng(k), R.BASE)[1]
         shown_base += len(bought & set(items.tolist()))
         cand = R.candidates(ST, int(req["t"]), 0, 0, ui, [], np.random.default_rng(k), block_bought=False)
         assert bought & set(cand.tolist()) or not any(ST.ok[list(bought)])   # ara sí que són candidats
-        _, items, _, _ = R.recommend(ST, RK, req, np.random.default_rng(k), V.VARIANTS["m1-rebuy"])
+        items = R.recommend(ST, RK, req, np.random.default_rng(k), V.VARIANTS["m1-rebuy"])[1]
         shown_rebuy += len(bought & set(items.tolist()))
     assert shown_base == 0            # el model base no en mostra mai cap
     assert shown_rebuy > 0            # la variant sí (quan el ranker els puntua prou amunt)
@@ -126,8 +166,6 @@ def test_m3_live_layer():
 
 def test_arms_parsing_and_stable_split():
     twin.variants.ARTIFACTS = TMP
-    (TMP / "model").mkdir(exist_ok=True)
-    (TMP / "model" / "meta.json").write_text("{}")
     arms = V.parse_arms("twin-v1:60,m1-rebuy:20,m2-intent:10,m3-live:10", "twin-v1")
     assert [v.name for v, _ in arms] == ["twin-v1", "m2-intent", "m3-live"]        # m1 cau: no hi ha model_rebuy
     assert abs(sum(w for _, w in arms) - 1) < 1e-9
@@ -154,11 +192,67 @@ def test_train_keep_bought_runs_and_reports_repurchases():
     assert m["repurchase_share_of_purchases"] > 0.2            # al sintètic els ja comprats es compren molt
     assert m["top1_bought_model"] >= m["top1_bought_model_if_blocked"]
     rk = R.Ranker(TMP / "model_rebuy")                         # el model nou es carrega i serveix
-    ids, items, _, _ = R.recommend(ST, rk, _req(3), np.random.default_rng(0), V.VARIANTS["m1-rebuy"])
+    ids, items = R.recommend(ST, rk, _req(3), np.random.default_rng(0), V.VARIANTS["m1-rebuy"])[:2]
     _valid(ids, items)
     twin.train.main(False, keep_bought=False, out="model_check")   # el camí original segueix funcionant
     m0 = json.loads((TMP / "model_check" / "meta.json").read_text())["metrics"]
     assert not m0["keep_bought"] and m0["rows_left_out_already_bought"] > 0
+
+
+def test_decision_log_and_feedback_training():
+    # 1) el bucle desa les features de cada resposta; aquí en simulem 3 hores
+    log = twin.declog.DecLog(twin.state.NF, directory=TMP / "declog")
+    rng, served = np.random.default_rng(5), {}
+    for k in range(2400):
+        req = _req(k)
+        req["request_id"], req["t"] = f"fb{k}", INFO["cut"] + k * 4500
+        ids, items, ec, eb, Xs = R.recommend(ST, RK, req, rng, R.BASE)
+        log.add(req["request_id"], req["t"], "twin-v1", ids, Xs, ec, eb)
+        served[req["request_id"]] = ids
+    log.add("fb0", INFO["cut"], "twin-v1", served["fb0"], Xs, ec, eb)          # una petició repetida no es duplica
+    log.add("curta", INFO["cut"], "twin-v1", ["a"], Xs, ec, eb)                # una resposta incompleta s'ignora
+    log.flush()
+    data = twin.declog.load(TMP / "declog")
+    assert len(data["rid"]) == 2400 and data["X"].shape == (2400, 10, twin.state.NF) and data["pids"].shape == (2400, 10)
+    assert len(list((TMP / "declog").glob("*.npz"))) >= 3 and not list((TMP / "declog").glob("*.tmp*"))
+
+    # 2) feedback simulat: es clica sobretot el slot 1 i els productes barats; un 15 % ho serveix el fallback
+    price = dict(zip(INFO["pid"], ST.price[:len(INFO["pid"])]))
+    rows = []
+    for k, (rid, ids) in enumerate(served.items()):
+        p = np.array([0.25 / (j + 1) * (2.0 if price.get(i, 99) < 60 else 0.5) for j, i in enumerate(ids)])
+        j = int(np.argmax(rng.random(10) < p)) if (rng.random(10) < p).any() else -1
+        click = ids[j] if j >= 0 else ""
+        rows.append({"rid": rid, "served_by": "fallback" if k % 7 == 0 else "team", "clicked": click,
+                     "purchased": click if click and rng.random() < 0.4 else ""})
+    import pandas as pd
+    TF.q_csv = lambda sql, **kw: pd.DataFrame(rows)
+    TF.declog.DIR = TMP / "declog"
+    TF.ARTIFACTS = TMP
+    TF.HISTORY = TMP / "train" / "matrix.npz"
+    if not TF.HISTORY.exists():
+        make_snapshot(TMP / "train", live=False)
+        twin.train.ARTIFACTS, twin.train.CACHE = TMP, TF.HISTORY
+        twin.train.main(False, out="model_tmp")
+
+    # 3) entrenament amb historial + feedback, validat amb l'última hora de feedback
+    TF.main("model_fb", 3.0, 1.0, True, True, 1.0)
+    import json
+    m = json.loads((TMP / "model_fb" / "meta.json").read_text())["metrics"]
+    assert m["feedback_rows_train"] + m["feedback_rows_valid"] == 10 * sum(r["served_by"] == "team" for r in rows)
+    assert m["history_rows"] > 0 and m["refit_on_all"] and 0.3 < m["new"]["click_calibration"] < 3
+    assert m["new"]["click_logloss"] < m["current"]["click_logloss"]            # aprèn el patró del feedback simulat
+    rk = R.Ranker(TMP / "model_fb")
+    ids, items = R.recommend(ST, rk, _req(1), np.random.default_rng(0), V.get_variant("fb"))[:2]
+    _valid(ids, items)
+    twin.variants.ARTIFACTS = TMP
+    assert [v.name for v, _ in V.parse_arms("fb:1", "x")] == ["fb"]             # ara el braç fb ja és vàlid
+    TF.main("model_fb2", 3.0, 1.0, False, False, 1.0)                           # només feedback, sense historial
+    try:
+        TF.main("model", 3.0, 1.0, False, False, 1.0)
+        raise AssertionError("no hauria de deixar sobreescriure artifacts/model")
+    except SystemExit:
+        pass
 
 
 if __name__ == "__main__":
