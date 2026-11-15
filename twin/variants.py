@@ -37,6 +37,7 @@ The three variants change one thing each, so the comparison says which idea work
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import zlib
 from dataclasses import dataclass, replace
 
@@ -48,6 +49,7 @@ from twin.state import State, to_ms
 FINAL_START_MS = to_ms("2026-11-15 09:00:00")     # Sunday 10:00 CET: the stream switches to new data
 EXAM = (1.0 / (1.0 + 0.35 * np.arange(10))).astype(np.float64)   # how much each slot is looked at (slot 1 = 1)
 LN2 = float(np.log(2.0))
+REL_K = 10.0          # weighted events (view 1, purchase 5) in the fast window at which a product's trend counts half
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,15 @@ class Variant:
     bandit: bool = True           # correct the score with observed/expected clicks of our own carousels
     buy_power: float = 1.0        # score = p_click * p_buy ** buy_power
     price_eps: float = 0.0005     # score *= 1 + price_eps * price (revenue is only the tie-breaker)
+    wide: bool = False            # wider candidate pool: see candidates() and widen() in twin/recommend.py
+    cold_model: str = ""          # a second ranker used ONLY for products without history (see cold_blend in twin/recommend.py)
+    new_mult: float = 1.0         # score *= new_mult for products added during the event (live: they took ~15% of our
+                                  # slots with a third of the CTR of the rest, 02:30-03:30 UTC; see novetats.py)
+    trend_power: float = 1.0      # weight of the newest information: live-layer trend (last ~20 min vs ~6 h) ** trend_power (0 = ignore it)
+    trend_rel: bool = False       # powers above 1 only in proportion to the evidence behind each product's trend (see LiveLayer.multipliers)
+    engine: str = "twin"          # "conv": requests of this arm are answered by the teammate's conv recommender (twin/conv_arm.py)
+    trend_src: str = "live"       # "live": trend from the decayed counters of the loop | "sql": trend computed in RawTree (see TrendSQL in twin/live.py)
+                                  # | "seed": "live" plus a prior for products added after start (see LiveLayer.events)
 
 
 VARIANTS = {
@@ -80,8 +91,55 @@ VARIANTS = {
     "buy07": Variant("buy07", buy_power=0.7),
     "fb": Variant("fb", model="model_fb"),
     "v5-hybrid": Variant("v5-hybrid", model="model_v5"),   # twin-v1 + the 4 hybrid variables (twin/hybrid_live.py)
+    "wide": Variant("wide", wide=True),                    # more candidates: thin profiles, recency-weighted views, price drops, new products
+    "v6-fb": Variant("v6-fb", model="model_v6"),          # V5 retrained with our own feedback (twin/train_v6.py)
+    # V6 as served: the v6-fb ranker + intent slate + live layer + no exploration slots (all 10 by expected value)
+    "v6": Variant("v6", model="model_v6", slate="intent", live_layer=True, exploit_slots=10),
+    # v7 family (twin/train_v7.py): v5 + new-product copies (+ propensity weighting)
+    "v7": Variant("v7", model="model_v7"),
+    "v7c": Variant("v7c", model="model_v7c"),          # new-product copies, no propensity
+    "v7s": Variant("v7s", model="model_v7s"),          # copies + soft propensity (power 0.5, cap 5)
+    "v7base": Variant("v7base", model="model_v7base"),  # control: v5 recipe
+    "v8": Variant("v8", model="model_v7s"),            # = v7s, served alone (worse than v5 live on known products)
+    # cold8: keep the arm's ranker for every product with history; products added during the event
+    # (no history) are scored by model_v7s, which learned them from the new-product copies
+    "cold8": Variant("cold8", cold_model="model_v7s"),
+    # V9 = the best of the three: V6 as served (feedback-retrained ranker, intent slate, live layer,
+    # no exploration slots) + v8 for products without history only
+    "v9": Variant("v9", model="model_v6", slate="intent", live_layer=True, exploit_slots=10, cold_model="model_v7s"),
+    # strength of the intent slate (m2-intent): 0.5 = closer to a plain sort, 2 = more variety across categories
+    "lam05": Variant("lam05", lam=0.5),
+    "lam2": Variant("lam2", lam=2.0),
+    # products added during the event: score halved / quartered (they reach the slate too often, see new_mult)
+    "new05": Variant("new05", new_mult=0.5),
+    "new025": Variant("new025", new_mult=0.25),
+    # weight of the newest information (needs m3-live): the per-product trend multiplier is 0.8-1.4 by default;
+    # trend2 squares it (0.64-1.96), so what is rising in the last ~20 minutes counts more; trend0 switches it off
+    "trend2": Variant("trend2", trend_power=2.0),
+    "trend0": Variant("trend0", trend_power=0.0),
+    "trend3": Variant("trend3", trend_power=3.0),
+    # the trend computed by RawTree every ~90 s over the real last 20 min / 6 h windows (twin/live.py TrendSQL): it
+    # does not start from zero after a restart, nor for a product that appeared during the event (the decayed
+    # counters of the loop start at 0 for those, so any activity gives them the maximum boost)
+    "sqltrend": Variant("sqltrend", trend_src="sql"),
+    # trend2/trend3 raise the trend of EVERY product to a power, also of products with a handful of events, where
+    # the trend is mostly noise (offline, a noisy trend costs more the higher the power: twin/exp_final.py --fast-h).
+    # trendrel keeps power 1 for those and reaches the full power only for products with enough events:
+    # exponent = 1 + (power - 1) * e / (e + 10), e = weighted events expected in the fast window from the slow rate
+    "trendrel": Variant("trendrel", trend_rel=True),
+    # the teammate's conv recommender (branch conv-v1), served as one arm; model_v5 only passes the model-folder check
+    "pissarra": Variant("pissarra", model="model_v5", engine="conv"),
+    # the loop trend with a prior for products added after the loop started (LiveLayer.events): a new product is
+    # not "rising" only because its counters start at zero. Same as "live" for every product that already existed.
+    "seedtrend": Variant("seedtrend", trend_src="seed"),
 }
-ARMS_FILE = ARTIFACTS.parent / "config" / "twin_arms.txt"
+# TWIN_ARMS_FILE points a dry run at its own arms file, so it can test new arms while the live loop keeps the real one
+ARMS_FILE = Path(os.environ["TWIN_ARMS_FILE"]) if os.environ.get("TWIN_ARMS_FILE") else ARTIFACTS.parent / "config" / "twin_arms.txt"
+
+
+def arm_models(arms) -> set[str]:
+    """Every model folder the arms need: their ranker and, if any, their ranker for new products."""
+    return {m for v, _ in arms for m in (v.model, v.cold_model) if m}
 
 
 def get_variant(name: str) -> Variant:
@@ -112,6 +170,9 @@ def parse_arms(spec: str, default_name: str, strict: bool = False) -> list[tuple
             continue
         if not (ARTIFACTS / v.model / "meta.json").exists():
             print(f"arm '{v.name}' skipped: artifacts/{v.model}/ does not exist")
+            continue
+        if v.cold_model and not (ARTIFACTS / v.cold_model / "meta.json").exists():
+            print(f"arm '{v.name}' skipped: artifacts/{v.cold_model}/ (its model for new products) does not exist")
             continue
         if w > 0:
             arms.append((v, w))
@@ -222,9 +283,22 @@ class LiveLayer:
         rate = (st.views_7d + 5 * st.purch_7d).astype(np.float64) / (7 * 86_400_000)
         self.fast, self.slow = rate * self.fast_ms / LN2, rate * self.slow_ms / LN2
         self.t_trend = float(st.now_ms)
+        # "seeded" trend (trend_src="seed"): the same counters, plus a prior for every product that appears AFTER
+        # this point (new_product during the event). Without it such a product starts with fast = slow = 0: the
+        # fast counter fills in minutes, the slow one in hours, so for hours it looks "rising" only for being new
+        # (~+17% after an hour at an average rate, up to the 1.4 cap if busier; squared by trend2), although new
+        # products convert worse (see novetats.py). The prior is its inherited 7-day rate (State._inherit), the
+        # same start __init__ gives every product that already exists. tests/test_trend.py checks both.
+        self.seed_fast, self.seed_slow = np.zeros(cap, np.float64), np.zeros(cap, np.float64)
+        self.n_seeded = st.P
+        self._trend_seed = np.ones(cap, np.float32)
         self.boost_until = f64(cap)
         self.final_done = st.now_ms >= FINAL_START_MS
         self._trend = np.ones(cap, np.float32)
+        self._trend_sql = np.ones(cap, np.float32)   # filled by sql_trend(); used by variants with trend_src="sql"
+        self._rel = np.zeros(cap, np.float32)        # evidence behind _trend, 0..1 (variant trendrel)
+        self._rel_sql = np.zeros(cap, np.float32)    # the same for _trend_sql
+        self.sql_t = 0.0                             # when it was last filled (organisers' clock, ms)
 
     # ---- feedback ------------------------------------------------------------------------------
     def _decay_bandit(self, now_ms: float) -> None:
@@ -238,6 +312,25 @@ class LiveLayer:
             for a in (self.click_obs, self.click_exp, self.sub_obs, self.sub_exp, self.cat_buy_obs, self.cat_buy_exp):
                 a *= 0.25
             self.final_done = True
+
+    def restore(self, st: State, rows: list[dict], now_ms: float) -> int:
+        """After a restart: the click evidence of our recent carousels, already decayed to `now_ms`
+        (and cut to a quarter if it predates the final while the final is on) by LAYER_RESTORE in
+        twin/live.py. Purchases per category are not restored: they start neutral (clipped to 0.8-1.3)."""
+        n = 0
+        for r in rows:
+            i = st.idx.get(r["p"])
+            if i is None:
+                continue
+            e, c = float(r["expected"]), float(r["clicks"])
+            self.click_exp[i] += e
+            self.click_obs[i] += c
+            self.sub_exp[st.sub[i]] += e
+            self.sub_obs[st.sub[i]] += c
+            n += 1
+        self.t_bandit = float(now_ms)            # the rows are decayed to now: do not decay them again
+        self.final_done = now_ms >= FINAL_START_MS
+        return n
 
     def feedback(self, st: State, items: np.ndarray, exp_click: np.ndarray, exp_buy: np.ndarray,
                  clicked: int, bought: int, now_ms: float) -> None:
@@ -259,9 +352,18 @@ class LiveLayer:
             return
         now = float(max(int(r["t"]) for r in rows))
         dt = max(now - self.t_trend, 0.0)
-        self.fast *= 0.5 ** (dt / self.fast_ms)
-        self.slow *= 0.5 ** (dt / self.slow_ms)
+        gf, gs = 0.5 ** (dt / self.fast_ms), 0.5 ** (dt / self.slow_ms)
+        self.fast *= gf
+        self.slow *= gs
+        self.seed_fast *= gf
+        self.seed_slow *= gs
         self.t_trend = max(now, self.t_trend)
+        if st.P > self.n_seeded:          # products registered since the last batch: give them their prior
+            new = np.arange(self.n_seeded, min(st.P, len(self.seed_fast)))
+            rate = (st.views_7d[new] + 5 * st.purch_7d[new]).astype(np.float64) / (7 * 86_400_000)
+            self.seed_fast[new] += rate * self.fast_ms / LN2
+            self.seed_slow[new] += rate * self.slow_ms / LN2
+            self.n_seeded = st.P
         idx, w = [], []
         for r in rows:
             i = st.idx.get(r["p"])
@@ -277,6 +379,49 @@ class LiveLayer:
         trend = np.ones(len(self._trend), np.float32)
         trend[:n] = np.clip(((rate_f + a) / (rate_s + a)) ** 0.3, 0.8, 1.4)
         self._trend = trend      # new array, swapped in one go
+        sf = rate_f + self.seed_fast[:n] * LN2 / self.fast_ms
+        ss = rate_s + self.seed_slow[:n] * LN2 / self.slow_ms
+        seeded = np.ones(len(self._trend_seed), np.float32)
+        seeded[:n] = np.clip(((sf + a) / (ss + a)) ** 0.3, 0.8, 1.4)
+        self._trend_seed = seeded
+        rel = np.zeros(len(self._rel), np.float32)
+        e = rate_s * self.fast_ms                   # weighted events expected in the fast window
+        rel[:n] = e / (e + REL_K)
+        self._rel = rel
+
+    def sql_trend(self, st: State, rows: list[dict], now_ms: float, fast_min: float = 20.0, slow_min: float = 360.0) -> dict:
+        """Trend per product from RawTree (rows of TREND_SQL in twin/live.py: p, f = weighted events of the last
+        `fast_min` minutes, s = of the last `slow_min`, first = time of its first event in that window, ms).
+        Same formula as events(), but on real windows: rate = events per minute; the slow rate of a product added
+        during the event is divided by the minutes since its first event (at least `fast_min`), not by 6 h, so
+        a product that has just appeared is not 'trending' only because it is new. Products with no events -> 1."""
+        n = st.P
+        rf, rs = np.zeros(n), np.zeros(n)
+        for r in rows:
+            i = st.idx.get(r["p"])
+            if i is None or i >= n:
+                continue
+            span = slow_min
+            if st.is_new[i]:
+                span = min(max((now_ms - float(r["first"])) / 60_000.0, fast_min), slow_min)
+            rf[i] = float(r["f"]) / fast_min
+            rs[i] = float(r["s"]) / span
+        a = max(float(rs.mean()), 1e-12)
+        trend = np.ones(len(self._trend_sql), np.float32)
+        trend[:n] = np.clip(((rf + a) / (rs + a)) ** 0.3, 0.8, 1.4)
+        self._trend_sql = trend      # new array, swapped in one go
+        rel = np.zeros(len(self._rel_sql), np.float32)
+        e = rs * fast_min
+        rel[:n] = e / (e + REL_K)
+        self._rel_sql = rel
+        self.sql_t = float(now_ms)
+        up = trend[:n]
+        return {"products": len(rows), "rising": int((up > 1.05).sum()), "falling": int((up < 0.95).sum()),
+                "max": float(up.max()) if n else 1.0}
+
+    def sql_fresh(self, now_ms: float) -> bool:
+        """The RawTree trend is usable: filled less than 5 minutes ago."""
+        return self.sql_t > 0 and now_ms - self.sql_t < 300_000
 
     def price_change(self, i: int, old_price: float, new_price: float, now_ms: float) -> None:
         if old_price > 0 and new_price < 0.9 * old_price:
@@ -284,7 +429,8 @@ class LiveLayer:
 
     # ---- multipliers -----------------------------------------------------------------------------
     def multipliers(self, st: State, cand: np.ndarray, rng: np.random.Generator, now_ms: float,
-                    a_item: float = 4.0, a_sub: float = 8.0, a_cat: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
+                    a_item: float = 4.0, a_sub: float = 8.0, a_cat: float = 10.0,
+                    trend_power: float = 1.0, trend_src: str = "live", trend_rel: bool = False) -> tuple[np.ndarray, np.ndarray]:
         """(posterior mean, Thompson sample) multipliers for the ranker's score of each candidate."""
         g = (self.sub_obs.sum() + 20) / (self.sub_exp.sum() + 20)
         sub = st.sub[cand]
@@ -294,7 +440,19 @@ class LiveLayer:
         gb = (self.cat_buy_obs.sum() + 5) / (self.cat_buy_exp.sum() + 5)
         cat = np.minimum(st.cat[cand], len(self.cat_buy_exp) - 1)
         m_buy = np.clip((self.cat_buy_obs[cat] + a_cat * gb) / (self.cat_buy_exp[cat] + a_cat) / gb, 0.8, 1.3)
-        extra = m_buy * self._trend[cand] * np.where(self.boost_until[cand] > now_ms, 1.15, 1.0)
+        use_sql = trend_src == "sql" and self.sql_fresh(now_ms)                                    # stale SQL -> loop trend
+        if trend_src == "seed":
+            base = self._trend_seed                                   # "live" + prior for products added after start
+        else:
+            base = self._trend_sql if use_sql else self._trend
+        if trend_power == 1.0:
+            trend = base[cand]
+        elif trend_rel and trend_power > 1.0:
+            rel = (self._rel_sql if use_sql else self._rel)[cand].astype(np.float64)
+            trend = base[cand].astype(np.float64) ** (1.0 + (trend_power - 1.0) * rel)
+        else:
+            trend = base[cand].astype(np.float64) ** trend_power
+        extra = m_buy * trend * np.where(self.boost_until[cand] > now_ms, 1.15, 1.0)
         mean = np.clip(np.clip(shape / rate / g, 0.3, 3.0) * extra, 0.25, 3.5)
         sample = np.clip(np.clip(rng.gamma(shape, 1.0 / rate) / g, 0.2, 4.0) * extra, 0.2, 4.5)
         return mean, sample

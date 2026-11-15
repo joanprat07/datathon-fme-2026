@@ -56,9 +56,18 @@ def top(scores: np.ndarray, k: int) -> np.ndarray:
 
 
 def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], rng: np.random.Generator,
-               block_bought: bool = BLOCK_BOUGHT) -> np.ndarray:
+               block_bought: bool = BLOCK_BOUGHT, wide: bool = False) -> np.ndarray:
+    """`wide` (variant "wide") adds, without changing anything else:
+    - a shopper we know little about (fewer than 5 events; live, st.user() gives every shopper an
+      index, so "ui < 0" never happens) gets the top 300 by popularity instead of 40, and the top
+      100 of their device x region instead of 40. Measured on 406 validation purchases
+      (proves_numeriques/recall.py, 15/11 00:34): the cold pool held the bought product 82.0% of
+      the time, top-300 popularity alone 96.8%; known shoppers were at 98.5%.
+    - the last 10 views (not 5) vote together, each weighing 0.7x the one after it: products linked
+      to several recent views, above all the newest, enter the pool even if no single view ranks them."""
     n = st.P
-    picks: list[np.ndarray] = [st.pop_order[:40], top(st.car_clicks[:n], 20)]
+    thin = wide and (ui < 0 or st.u_events[ui] < 5)
+    picks: list[np.ndarray] = [st.pop_order[:300 if thin else 40], top(st.car_clicks[:n], 20)]
     subs: list[int] = []
     past: list[int] = []
 
@@ -69,6 +78,13 @@ def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], r
             picks.append(top(st.VV[a, :n] / st.nv[:n], 60 if j == 0 else 25))
             picks.append(top(st.VP[a, :n] / st.nb[:n], 30 if j == 0 else 10))
         subs += list(dict.fromkeys(int(s) for s in st.sub[recent]))[:2]
+        if wide:
+            last = np.asarray(list(dict.fromkeys(reversed(rv)))[:10])
+            w = 0.7 ** np.arange(len(last))
+            picks.append(last)
+            # each view's row is scaled by its own popularity, so one heavily viewed product cannot outvote the rest
+            picks.append(top((w[:, None] * st.VV[last, :n] / st.nv[last][:, None]).sum(0) / st.nv[:n], 80))
+            picks.append(top((w[:, None] * st.VP[last, :n] / st.nv[last][:, None]).sum(0) / st.nb[:n], 40))
 
     if ui >= 0:
         # the shopper's own products: what they bought and what they looked at most
@@ -89,7 +105,7 @@ def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], r
             picks.append(st.sub_top[s][:40 if j == 0 else 25])
 
     if dev >= 0 and reg >= 0:
-        picks.append(top(st.seg[dev, reg, :n], 40))
+        picks.append(top(st.seg[dev, reg, :n], 100 if thin else 40))
     trend = st.sub_trend(ts)
     for s in np.argsort(-trend)[:3]:
         if int(s) in st.sub_top:
@@ -109,6 +125,40 @@ def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], r
     return cand
 
 
+def widen(st: State, rk: Ranker, layer, cand: np.ndarray, ts: int, ui: int, rv: list[int], block_bought: bool) -> np.ndarray:
+    """Variant "wide": two more sources of candidates that need the live layer or the embeddings.
+
+    - Price drops: the live layer boosts a product for an hour after its price falls by more than
+      10%, but only if something else had already made it a candidate. Here the 30 most popular
+      discounted products enter the pool, so a discount can be shown to anyone.
+    - New products in the session: a product added during the event has no co-views of its own
+      (it borrows its neighbours'). When one of the last views is new, the 30 products with the
+      closest description (content vectors of the v5 ranker) enter the pool too."""
+    more: list[np.ndarray] = []
+    if layer is not None:
+        hot = np.flatnonzero(layer.boost_until[:st.P] > ts)
+        if len(hot):
+            more.append(hot[np.argsort(-st.pop[hot])[:30]])
+    if rk.emb is not None and rv:
+        fresh = [a for a in dict.fromkeys(reversed(rv)) if st.is_new[a]][:2]
+        if fresh:
+            if rk.emb.content is None or st.P > rk.emb.n:
+                rk.emb._extend(st)
+            E = rk.emb.content[:st.P]
+            for a in fresh:
+                if float(E[a] @ E[a]) > 0.5:          # no usable description vector: nothing to look up
+                    more.append(top(E @ E[a], 30))
+    if not more:
+        return cand
+    add = np.unique(np.concatenate(more))
+    add = add[st.ok[add]]
+    if block_bought and ui >= 0:
+        past = st.bought_before(ui, ts)[0]
+        if past:
+            add = add[~np.isin(add, past)]
+    return np.union1d(cand, add)
+
+
 def fallback(st: State, exclude: set[int] = frozenset(), k: int = 10) -> list[int]:
     """All-time best sellers that are active and in stock: what the organisers' fallback shows."""
     out = []
@@ -123,7 +173,45 @@ def fallback(st: State, exclude: set[int] = frozenset(), k: int = 10) -> list[in
 BASE = Variant()
 
 
-def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Variant = BASE, layer=None):
+MIN_KNOWN = 20         # cold_blend needs this many candidates with history to map one model's scale onto the other's
+
+
+def _transfer(src: np.ndarray, dst: np.ndarray, known: np.ndarray, new: np.ndarray) -> np.ndarray:
+    """For each new candidate: its percentile under `src` among the known candidates, read back as
+    the value `dst` has at that percentile among the same known candidates. Keeps the cold model's
+    ORDER for new products but expresses it on the main model's scale, so the two can share a slate
+    even if the cold model's probabilities are off (they were: v8 alone did worse live)."""
+    ks, kd = np.sort(src[known]), np.sort(dst[known])
+    q = np.searchsorted(ks, src[new], side="right") / len(ks)
+    return np.quantile(kd, np.clip(q, 0.0, 1.0))
+
+
+def cold_blend(st: State, cold: Ranker, cand: np.ndarray, X56: np.ndarray, rv: list[int], ui: int,
+               emb_cols, p_click: np.ndarray, p_buy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Products added during the event (st.is_new) get their scores from `cold`; the rest keep the
+    main ranker's. With fewer than MIN_KNOWN known candidates (e.g. a catalogue that is almost all
+    new) the cold model scores every candidate."""
+    new = st.is_new[cand]
+    if not new.any():
+        return p_click, p_buy
+    if cold.emb is not None:
+        if emb_cols is None:
+            emb_cols = cold.emb.features(st, rv, ui, cand)
+        Xc = np.column_stack([X56, emb_cols])
+    else:
+        Xc = X56
+    c_click, c_buy = cold.predict(Xc)
+    known = ~new
+    if known.sum() < MIN_KNOWN:
+        return c_click, c_buy
+    p_click, p_buy = p_click.copy(), p_buy.copy()
+    p_click[new] = _transfer(c_click, p_click, known, new)
+    p_buy[new] = _transfer(c_buy, p_buy, known, new)
+    return p_click, p_buy
+
+
+def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Variant = BASE, layer=None,
+              cold: Ranker | None = None):
     """Returns (10 product ids, their indices, expected click probability of each slot,
     expected purchase probability of each slot, the features of the chosen products at their
     slots). `v` selects the variant (twin/variants.py); with the default it behaves exactly as
@@ -134,20 +222,29 @@ def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Var
     ui = st.user(str(req["user_id"]))
     rv = [st.idx[p] for p in (req.get("rv") or []) if p in st.idx]
 
-    cand = candidates(st, ts, dev, reg, ui, rv, rng, v.block_bought)
+    cand = candidates(st, ts, dev, reg, ui, rv, rng, v.block_bought, v.wide)
+    if v.wide:
+        cand = widen(st, rk, layer, cand, ts, ui, rv, v.block_bought)
     if len(cand) < 10:
         bought = set(st.bought_before(ui, ts)[0]) if v.block_bought else set()
         cand = np.unique(np.concatenate([cand, np.asarray(fallback(st, bought, 20), dtype=int)]))
-    X = st.featurize(ts, page, dev, reg, ui, rv, cand, 1)
+    X = X56 = st.featurize(ts, page, dev, reg, ui, rv, cand, 1)
+    emb_cols = None
     if rk.emb is not None:                              # v5-hybrid ranker: append the four hybrid variables
-        X = np.column_stack([X, rk.emb.features(st, rv, ui, cand)])
+        emb_cols = rk.emb.features(st, rv, ui, cand)
+        X = np.column_stack([X, emb_cols])
     p_click, p_buy = rk.predict(X)
+    p_click_main = p_click
+    if cold is not None:                                # variant with cold_model: new products scored by it
+        p_click, p_buy = cold_blend(st, cold, cand, X56, rv, ui, emb_cols, p_click, p_buy)
     p_purchase = p_click * (p_buy if v.buy_power == 1.0 else p_buy ** v.buy_power)
     value = p_purchase * (1 + v.price_eps * st.price[cand])
+    if v.new_mult != 1.0:                               # variant new05 / new025: products added during the event weigh less
+        value = value * np.where(st.is_new[cand], v.new_mult, 1.0)
     if not v.bandit:
         mean = sample = np.ones(len(cand))
     elif v.live_layer and layer is not None:
-        mean, sample = layer.multipliers(st, cand, rng, ts)
+        mean, sample = layer.multipliers(st, cand, rng, ts, trend_power=v.trend_power, trend_src=v.trend_src, trend_rel=v.trend_rel)
     else:
         mean, sample = st.bandit(cand, rng)
     exploit, explore = value * mean, value * sample
@@ -181,6 +278,8 @@ def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Var
     Xs = X[chosen].copy()
     Xs[:, SLOT] = np.arange(1, len(chosen) + 1)
     expected = rk.click.predict(Xs, num_threads=1)
+    if p_click is not p_click_main:                     # cold_blend changed some scores: same change at the shown slots
+        expected = np.minimum(expected * np.clip(p_click[chosen] / np.maximum(p_click_main[chosen], 1e-9), 0.05, 20.0), 0.95)
     expected_buy = expected * p_buy[chosen]
     if len(items) < 10:                                  # should not happen; keep the answer valid anyway
         extra = np.asarray(fallback(st, set(items.tolist()), 10 - len(items)), dtype=int)

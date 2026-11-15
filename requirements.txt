@@ -1,7 +1,9 @@
 requests
 pandas
 numpy
-jupyter
-lightgbm
 pyarrow
+lightgbm
 scikit-learn
+scipy
+joblib
+pytest

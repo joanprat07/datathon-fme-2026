@@ -53,7 +53,7 @@ WORD = re.compile(r"[a-z]+")
 
 
 class State:
-    def __init__(self, snapshot: str = "live", spare_products: int = 1200):
+    def __init__(self, snapshot: str = "live", spare_products: int = 2000):
         d = ARTIFACTS / snapshot
         meta = dict(line.split("=", 1) for line in (d / "meta.txt").read_text().splitlines() if "=" in line)
         self.cutoff_ms = to_ms(meta["cutoff"])

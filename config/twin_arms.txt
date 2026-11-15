@@ -1,0 +1,3 @@
+# v5tcs: l unic model del repositori, 100 %, sense holdout. Es rellegeix cada 15 s sense reiniciar.
+v5tcs=v5-hybrid+m2-intent+m3-live+trend2+cold8+seedtrend: 100
+holdout: 0

@@ -1,4 +1,32 @@
-# Shopper Twin
+# Shopper Twin · v5tcs
+
+This repository holds only the final model, **v5tcs**:
+
+```
+v5tcs = v5-hybrid + m2-intent + m3-live + trend2 + cold8 + seedtrend
+```
+
+| Part | What it does | Where |
+|---|---|---|
+| `v5-hybrid` | LightGBM ranker with 60 variables (the 56 base ones + 4 content/collaborative similarities) | `hybrid.py`, `hybrid_live.py` -> `artifacts/model_v5` |
+| `m2-intent` | slate filled by the shopper's intent instead of "at most 5 per subcategory" | `variants.py` |
+| `m3-live` | bandit with forgetting (2 h half-life), learns from the stream | `variants.py` (`LiveLayer`) |
+| `trend2` | per-product trend multiplier squared (0.64-1.96) | `variants.py` |
+| `cold8` | products without history are ranked by `model_v7s` (de-biased, trained for new products) | `train_v7.py` -> `artifacts/model_v7s` |
+| `seedtrend` | new products start from their inherited 7-day rate, so they are not "rising" just for being new | `variants.py` |
+
+Rebuild and run (from the repository root, venv active, `pip install -r requirements.txt`):
+
+1. `python -m twin.build train` · `python -m twin.train --refit` (base ranker, `artifacts/model`)
+2. `python -m twin.hybrid` (feature matrix with the 4 hybrid variables) · `python -m twin.hybrid_live` (`artifacts/model_v5`)
+3. `python -m twin.train_v7 --out model_v7s` (`artifacts/model_v7s`, used by `cold8`)
+4. `python -m twin.build live` · `python -m twin.live --dry --seconds 60`
+5. `python -m twin.supervisor` (or `.\start_live.ps1` on Windows). The arm is read from `config/twin_arms.txt`.
+
+Tests: `python -m pytest -q tests` (`test_v9.py` needs `artifacts/model_v5` and `artifacts/model_v7s`).
+
+---
+
 
 A two-stage recommender with an online learning layer, for the RawTree challenge.
 
@@ -54,6 +82,9 @@ To restart the loop automatically if it ever stops: `python -m twin.supervisor` 
 | `monitor.py` | Reliability and conversion per model version, from our feedback |
 | `variants.py` | Model variants for live comparison: `m1-rebuy`, `m2-intent`, `m3-live` (see `docs/ANALISI_TWIN.md`) |
 | `supervisor.py` | Starts the live loop and starts it again if it stops |
+| `hybrid.py`, `hybrid_live.py` | The 4 hybrid variables and the 60-variable ranker `model_v5` |
+| `train_v7.py` | The ranker for products without history (`model_v7s`, variant `cold8`) |
+| `embeddings.py`, `declog.py`, `train_feedback.py` | Text vectors for new products; decision log of every answer; retraining from our feedback |
 
 ## Design choices
 
