@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+/*__BASE_CSS__*/
+.stats { grid-template-columns: repeat(5, 1fr); }
+.stat .v { font-size: 32px; line-height: 38px; }
+.grid { display: grid; grid-template-columns: 5fr 7fr; gap: 16px; margin-top: 16px; }
+.gap { height: 16px; }
+.legend { display: flex; gap: 22px; font: 12px "Roboto Mono", monospace; color: var(--g300); }
+.legend i { display: inline-block; width: 18px; height: 2px; vertical-align: middle; margin-right: 8px; }
+
+/* ---- left: incoming shoppers ---- */
+.feed { position: relative; height: 540px; overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 45%, transparent 98%);
+          mask-image: linear-gradient(to bottom, #000 0%, #000 45%, transparent 98%); }
+.user { position: absolute; left: 12px; right: 12px; height: 78px; padding: 11px 14px;
+  border: 1px solid var(--g800); background: var(--bg);
+  transition: transform .7s cubic-bezier(.2,.7,.2,1), opacity .7s, border-color .7s, filter .7s; }
+.user.current { border-color: var(--green); background: linear-gradient(90deg, rgba(39,247,149,.07), transparent 70%); }
+.user .row1 { display: flex; justify-content: space-between; align-items: baseline; }
+.user .uid { font: 15px "Roboto Mono", monospace; color: #fff; }
+.user.current .uid { color: var(--green); }
+.user .ts { font: 11px "Roboto Mono", monospace; color: var(--g500); }
+.user .row2 { display: flex; gap: 8px; margin-top: 9px; align-items: center; white-space: nowrap; overflow: hidden; }
+.badge { font: 11px "Roboto Mono", monospace; padding: 1px 6px; border: 1px solid var(--g700); color: var(--g300); }
+.badge.new { border-color: var(--amber); color: var(--amber); }
+.outcome { margin-left: auto; font: 12px "Roboto Mono", monospace; color: var(--g500); }
+.outcome.buy { color: var(--green); }
+.views { font: 11px "Roboto Mono", monospace; color: var(--g500); margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- right: top-10 ---- */
+.recs { padding: 4px 0; height: 540px; overflow: hidden; }
+.rec { display: grid; grid-template-columns: 34px 1fr 66px 150px 78px 72px; align-items: center; gap: 10px;
+  height: 52px; padding: 0 16px; border-bottom: 1px solid var(--g900); opacity: 0; transform: translateX(-28px); }
+.rec.in { animation: slidein .45s cubic-bezier(.2,.7,.2,1) forwards; }
+.rec.out { animation: slideout .25s ease-in forwards; }
+@keyframes slidein { to { opacity: 1; transform: none; } }
+@keyframes slideout { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-8px); } }
+.rec .rank { font: 13px "Roboto Mono", monospace; color: var(--g500); }
+.rec:first-child .rank { color: var(--green); }
+.rec .name { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rec .pid { font: 11px "Roboto Mono", monospace; color: var(--g500); margin-top: 2px; }
+.rec .price { font: 13px "Roboto Mono", monospace; text-align: right; color: #ddd; }
+.rec .tag { overflow: hidden; text-overflow: ellipsis; }
+.src { font: 11px "Roboto Mono", monospace; padding: 1px 6px; border: 1px solid var(--g700); color: var(--g300); text-align: center; }
+.src.sim { color: #27f795; border-color: #27f79566; } .src.cov { color: #7fe8b8; border-color: #7fe8b866; }
+.src.covx { color: #a594ff; border-color: #a594ff66; } .src.user { color: #f5c84c; border-color: #f5c84c66; }
+.src.trend { color: #ff9f6e; border-color: #ff9f6e66; } .src.explore { color: #fff; border-color: #fff; border-style: dashed; }
+.rec .sbar { height: 4px; background: var(--g800); position: relative; }
+.rec .sbar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--green); width: 0; transition: width .6s .2s; }
+.rec.bought { background: linear-gradient(90deg, rgba(39,247,149,.10), transparent 80%); }
+.rec.bought .name::after { content: "  ● bought"; font: 11px "Roboto Mono", monospace; color: var(--green); }
+.meta { display: flex; gap: 18px; }
+
+.chart { position: relative; height: 300px; }
+canvas { display: block; width: 100%; height: 100%; }
+.g2 { display: grid; grid-template-columns: 1fr; gap: 16px; }
+.foot { font: 12px "Roboto Mono", monospace; color: var(--g500); margin-top: 12px; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <span id="status" class="live">[ shop.requests → team_28.submissions ] streaming</span>
+  <div class="legend"><span><i style="background:var(--green)"></i>pandabuy</span>
+    <span><i style="background:var(--red)"></i>baseline · best sellers</span></div>
+  <div class="ctrl" id="speed">
+    <button data-x="0">❚❚</button><button data-x="1">1× real time</button><button data-x="10">10×</button><button data-x="60">60×</button>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="v" id="s-req">0</div><div class="c">Shoppers served</div></div>
+  <div class="stat"><div class="v green" id="s-ours">0.00 €</div><div class="c">Revenue · pandabuy</div></div>
+  <div class="stat"><div class="v red" id="s-base">0.00 €</div><div class="c">Revenue · baseline</div></div>
+  <div class="stat"><div class="v" id="s-up">—</div><div class="c">Uplift vs baseline</div></div>
+  <div class="stat"><div class="v" id="s-lat">—</div><div class="c">p95 answer time · limit 3 s</div></div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <div class="panel-h"><span><b>Incoming shoppers</b></span><span id="sample" class="dim"></span></div>
+    <div class="feed" id="feed"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-h">
+      <span><b>Our 10 products</b> &nbsp;<span id="who" class="green"></span></span>
+      <span class="meta"><span id="lat"></span><span id="pp"></span></span>
+    </div>
+    <div class="recs" id="recs"></div>
+  </div>
+</div>
+
+<div class="gap"></div>
+<div class="g2">
+  <div class="panel">
+    <div class="panel-h"><span><b>Cumulative revenue</b> (€)</span><span id="conv"></span></div>
+    <div class="chart"><canvas id="c1"></canvas></div>
+  </div>
+</div>
+<div class="foot">Simulation: real catalogue sample, real examination curve e(k) and real traffic (~<span id="rps"></span> requests/s at 1×).
+  Shoppers are synthetic, calibrated so that the best-seller baseline converts as it did live (<span id="tcvr"></span> purchases per request).
+  Both systems see exactly the same shoppers.</div>
+
+<script>
+/*__SIM__*/
+
+const $ = id => document.getElementById(id);
+const next = makeStream(PARAMS.seed);
+const S = { n: 0, revO: 0, revB: 0, buyO: 0, buyB: 0, ptsRev: [[0, 0, 0]], ptsConv: [], win: [], lat: [] };
+const WIN = 500, MAX_PTS = 1500, VISIBLE = 7, ROW = 90, SHOW_MS = 3200, OUTCOME_MS = 1250;
+let currentRid = null, lastBuyer = null, nShown = 0;
+let speed = 1, acc = 0, last = performance.now(), lastShow = 0, latest = null, sinceShow = 0;
+let users = [];
+const nodes = new Map();
+$("tcvr").textContent = PARAMS.target_cvr.toFixed(2) + " %"; $("rps").textContent = PARAMS.users_per_sec;
+
+// ------------------------------------------------------------------ market (every shopper)
+function consume() {
+  const u = next();
+  S.n += 1; sinceShow += 1;
+  if (u.boughtOurs) { S.revO += u.boughtOurs.price; S.buyO += 1; }
+  if (u.boughtBase) { S.revB += u.boughtBase.price; S.buyB += 1; }
+  S.win.push([u.pOurs, u.pBase]); if (S.win.length > WIN) S.win.shift();
+  S.lat.push(u.latency); if (S.lat.length > 2000) S.lat.shift();
+  S.ptsRev.push([S.n, S.revO, S.revB]);
+  if (S.n >= 50) {
+    const a = S.win.reduce((s, w) => s + w[0], 0) / S.win.length * 100;
+    const b = S.win.reduce((s, w) => s + w[1], 0) / S.win.length * 100;
+    S.ptsConv.push([S.n, a, b]);
+  }
+  for (const k of ["ptsRev", "ptsConv"]) if (S[k].length > MAX_PTS) S[k] = S[k].filter((_, i) => i % 2 === 0 || i === S[k].length - 1);
+  latest = u;
+  if (u.boughtOurs) lastBuyer = u;
+}
+
+function niceMax(v) { if (v <= 0) return 1; const p = Math.pow(10, Math.floor(Math.log10(v))); for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p; return 10 * p; }
+function fmtK(v) { return v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 0 : 1) + "k" : v.toFixed(0); }
+
+function draw(canvas, pts, opts) {
+  const dpr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
+  if (!W || !H) return;
+  if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const L = 56, R = 92, T = 18, B = 30, w = W - L - R, h = H - T - B;
+  const x0 = opts.xFrom ? opts.xFrom(pts) : 0;
+  const xmax = Math.max(niceMax(pts.length ? pts[pts.length - 1][0] : 1), 100);
+  const ymax = niceMax(Math.max(opts.minY || 1, ...pts.map(p => Math.max(p[1], p[2]))) * 1.08);
+  const X = x => L + ((x - x0) / (xmax - x0)) * w, Y = y => T + h - (y / ymax) * h;
+  g.font = '11px "Roboto Mono", monospace'; g.fillStyle = "#636679"; g.strokeStyle = "#262626"; g.lineWidth = 1;
+  g.setLineDash([2, 4]);
+  for (let i = 0; i <= 4; i++) {
+    const y = T + (h * i) / 4;
+    g.beginPath(); g.moveTo(L, y + .5); g.lineTo(L + w, y + .5); g.stroke();
+    g.textAlign = "right"; g.fillText(opts.fmtY(ymax * (1 - i / 4)), L - 10, y + 4);
+  }
+  g.setLineDash([]); g.textAlign = "center";
+  for (let i = 0; i <= 4; i++) { const xv = x0 + (xmax - x0) * i / 4; g.fillText(fmtK(xv), X(xv), H - 8); }
+  if (!pts.length) return;
+  const series = [[2, "#ff4f5e", "rgba(255,79,94,"], [1, "#27f795", "rgba(39,247,149,"]];
+  for (const [k, col, rgba] of series) {
+    if (opts.fill) {
+      const grad = g.createLinearGradient(0, T, 0, T + h);
+      grad.addColorStop(0, rgba + "0.18)"); grad.addColorStop(1, rgba + "0)");
+      g.beginPath(); g.moveTo(X(pts[0][0]), Y(0));
+      pts.forEach(p => g.lineTo(X(p[0]), Y(p[k])));
+      g.lineTo(X(pts[pts.length - 1][0]), Y(0)); g.closePath(); g.fillStyle = grad; g.fill();
+    }
+    g.beginPath(); pts.forEach((p, i) => i ? g.lineTo(X(p[0]), Y(p[k])) : g.moveTo(X(p[0]), Y(p[k])));
+    g.strokeStyle = col; g.lineWidth = 2; g.stroke();
+    const p = pts[pts.length - 1], x = X(p[0]), y = Y(p[k]);
+    g.beginPath(); g.arc(x, y, 3.5, 0, 7); g.fillStyle = col; g.fill();
+    g.beginPath(); g.arc(x, y, 8, 0, 7); g.fillStyle = rgba + "0.18)"; g.fill();
+    g.fillStyle = col; g.textAlign = "left"; g.font = '12px "Roboto Mono", monospace';
+    g.fillText(opts.fmtY(p[k], true), x + 12, y + 4);
+    g.font = '11px "Roboto Mono", monospace';
+  }
+}
+
+function render() {
+  draw($("c1"), S.ptsRev, { fill: true, minY: 100, fmtY: (v, head) => head ? fmtEur(v) : fmtK(v) + " €" });
+  $("s-req").textContent = S.n.toLocaleString("en-US");
+  $("s-ours").textContent = fmtEur(S.revO);
+  $("s-base").textContent = fmtEur(S.revB);
+  $("s-up").textContent = S.revB > 0 ? (S.revO >= S.revB ? "+" : "") + ((S.revO / S.revB - 1) * 100).toFixed(0) + "%" : "—";
+  $("s-up").className = "v " + (S.revO >= S.revB ? "green" : "red");
+  if (S.lat.length > 20) {
+    const s = [...S.lat].sort((a, b) => a - b);
+    $("s-lat").textContent = (s[Math.floor(s.length * 0.95)] / 1000).toFixed(2) + " s";
+  }
+  $("conv").innerHTML = `purchases <span class="green">${S.buyO}</span> <span class="dim">vs</span> <span class="red">${S.buyB}</span>`;
+}
+
+// ------------------------------------------------------------------ feed (a sample of the shoppers)
+function userCard(u) {
+  const el = document.createElement("div");
+  el.className = "user";
+  const views = u.recent.length ? "viewed: " + u.recent.map(p => p.name).join(" · ") : "no recent views";
+  el.innerHTML = `
+    <div class="row1"><span class="uid">${u.user_id}</span><span class="ts">${u.ts.slice(11, 23)}Z</span></div>
+    <div class="row2">
+      ${u.is_new_user ? '<span class="badge new">new · cold start</span>' : '<span class="badge">returning</span>'}
+      <span class="badge">${u.device}</span><span class="badge">${u.page}</span>
+      <span class="tag">${u.region}</span>
+      <span class="outcome">…</span>
+    </div>
+    <div class="views">${views}</div>`;
+  el.style.transform = `translateY(${-ROW}px)`;
+  el.style.opacity = 0;
+  return el;
+}
+
+function layoutFeed() {
+  users.forEach((u, i) => {
+    const el = nodes.get(u.request_id);
+    el.classList.toggle("current", i === 0);
+    el.style.transform = `translateY(${12 + i * ROW}px)`;
+    el.style.opacity = Math.max(0, 1 - i * 0.14);
+    el.style.filter = i > 3 ? `blur(${(i - 3) * 0.4}px)` : "none";
+  });
+}
+
+function showRecs(u) {
+  const box = $("recs");
+  [...box.children].forEach(c => { c.classList.remove("in"); c.classList.add("out"); });
+  const maxS = Math.max(...u.recs.map(r => r.a));
+  setTimeout(() => {
+    box.innerHTML = "";
+    u.recs.forEach((c, k) => {
+      const p = c.p, el = document.createElement("div");
+      el.className = "rec"; el.dataset.id = p.id;
+      const src = c.explore ? '<span class="src explore">explore</span>' : `<span class="src ${c.src}">${c.src}</span>`;
+      el.innerHTML = `
+        <span class="rank">${String(k + 1).padStart(2, "0")}</span>
+        <div style="min-width:0"><div class="name">${p.name}</div><div class="pid">${p.id}</div></div>
+        ${src}
+        <span class="tag">[${p.cat}]</span>
+        <span class="price">${p.price.toFixed(2)} €</span>
+        <div class="sbar"><i></i></div>`;
+      box.appendChild(el);
+      setTimeout(() => { el.classList.add("in"); el.querySelector(".sbar i").style.width = (100 * c.a / maxS).toFixed(0) + "%"; }, 55 * k);
+    });
+  }, 260);
+  currentRid = u.request_id;
+  $("who").textContent = "→ " + u.user_id;
+  $("lat").innerHTML = `answered in <span class="${u.latency < 1500 ? "green" : "red"}">${u.latency} ms</span>`;
+  $("pp").innerHTML = `P(buy) <span class="green">${(100 * u.pOurs).toFixed(1)}%</span> <span class="dim">vs</span> <span class="red">${(100 * u.pBase).toFixed(1)}%</span>`;
+}
+
+function showOutcome(u) {   // feedback arrives a bit after the answer, like team_28.feedback
+  const el = nodes.get(u.request_id);
+  if (!el) return;
+  const o = el.querySelector(".outcome");
+  if (u.boughtOurs) {
+    o.textContent = "+" + fmtEur(u.boughtOurs.price); o.classList.add("buy");
+    const row = document.querySelector(`.rec[data-id="${u.boughtOurs.id}"]`);
+    if (row && currentRid === u.request_id) row.classList.add("bought");
+  } else o.textContent = "no purchase";
+}
+
+function show(u) {
+  const el = userCard(u);
+  $("feed").appendChild(el);
+  nodes.set(u.request_id, el);
+  users.unshift(u);
+  while (users.length > VISIBLE) {
+    const old = users.pop(), n = nodes.get(old.request_id);
+    nodes.delete(old.request_id); n.style.opacity = 0; setTimeout(() => n.remove(), 800);
+  }
+  requestAnimationFrame(() => requestAnimationFrame(layoutFeed));
+  showRecs(u);
+  setTimeout(() => showOutcome(u), OUTCOME_MS);
+  $("sample").textContent = sinceShow > 1 ? `1 of every ${sinceShow} · buyers more often` : "every shopper";
+  sinceShow = 0;
+}
+
+// ------------------------------------------------------------------ loop
+function loop(now) {
+  const dt = Math.min(0.25, (now - last) / 1000); last = now;
+  acc += dt * PARAMS.users_per_sec * speed;
+  let k = 0; while (acc >= 1 && k < 3000) { consume(); acc -= 1; k++; }
+  if (speed > 0 && latest && now - lastShow > (speed > 1 ? 2800 : SHOW_MS)) {
+    lastShow = now;
+    // purchases are rare (~2 %): every other card, show the latest shopper who bought, if any since the last card
+    const u = nShown++ % 2 === 1 && lastBuyer ? lastBuyer : latest;
+    lastBuyer = null;
+    show(u);
+  }
+  render();
+  requestAnimationFrame(loop);
+}
+document.querySelectorAll("#speed button").forEach(b => b.onclick = () => {
+  speed = +b.dataset.x;
+  document.querySelectorAll("#speed button").forEach(x => x.classList.toggle("on", x === b));
+  $("status").classList.toggle("paused", speed === 0);
+  $("status").textContent = `[ shop.requests → team_28.submissions ] ${speed === 0 ? "paused" : "streaming"}`;
+});
+speed = 10;
+document.querySelector('#speed button[data-x="10"]').classList.add("on");
+for (let i = 0; i < 4; i++) { consume(); show(latest); }
+new ResizeObserver(render).observe(document.body);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

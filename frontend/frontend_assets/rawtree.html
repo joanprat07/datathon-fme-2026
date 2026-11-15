@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+/*__BASE_CSS__*/
+/*__PAGES_CSS__*/
+.timeline { padding: 18px 16px 6px; }
+</style>
+</head>
+<body>
+<h2 class="sec">RawTree: our database and our compute engine</h2>
+<p class="lead">Everything pandabuy knows comes from RawTree, and every answer goes back to it.</p>
+<div class="g3">
+  <div class="card"><div class="num">[01] aggregate</div><div class="big">≈12 M <small>events</small></div>
+    <p>aggregated <b>inside RawTree</b> with SQL (decayed counters, co-visits, profiles). We download only <b id="agg"></b> of results.</p></div>
+  <div class="card"><div class="num">[02] tail</div><div class="big">0.3 <small>s</small></div>
+    <p>between incremental reads of the live stream: only rows newer than the last seen, duplicates dropped in memory.</p></div>
+  <div class="card"><div class="num">[03] write</div><div class="big">1 <small>insert / cycle</small></div>
+    <p>all the answers of a cycle in <b>one batched insert</b> to <code>team_28.submissions</code>, retried on failure.</p></div>
+</div>
+<h2 class="sec">Tables we use</h2>
+<div class="stats" id="rates" style="margin-bottom:16px"></div>
+<div class="panel">
+  <table class="t">
+    <tr><th>table</th><th>access</th><th>what we take from it</th><th>when</th></tr>
+    <tr><td>shop.catalog</td><td><span class="pill r">read</span></td><td>category, subcategory, brand, price of every product</td><td>startup</td></tr>
+    <tr><td>shop.catalog_updates</td><td><span class="pill r">read · tail</span></td><td>price changes, out of / back in stock, new products (<span id="upd"></span>)</td><td>startup + every 0.3 s</td></tr>
+    <tr><td>shop.history_events</td><td><span class="pill r">read · SQL</span></td><td>≈12 M views, carts, purchases → decayed counters, co-visits, profiles</td><td>snapshot</td></tr>
+    <tr><td>shop.history_sessions</td><td><span class="pill r">read · SQL</span></td><td>≈2 M old carousels (shown, propensity, click, purchase) → training rows</td><td>training</td></tr>
+    <tr><td>shop.events</td><td><span class="pill r">read · tail</span></td><td>live views, carts, purchases → counters and profiles in memory</td><td>every 0.3 s</td></tr>
+    <tr><td>shop.requests</td><td><span class="pill r">read · tail</span></td><td>the shoppers we must answer</td><td>every 0.3 s</td></tr>
+    <tr><td>team_28.feedback</td><td><span class="pill r">read · tail</span></td><td>click and purchase on our own 10 → online learning</td><td>every 0.3 s</td></tr>
+    <tr><td>team_28.submissions</td><td><span class="pill w">write</span></td><td>our 10 products per request, batched</td><td>every 0.3 s</td></tr>
+  </table>
+</div>
+
+<h2 class="sec">What we learned about RawTree</h2>
+<div class="g4">
+  <div class="card"><div class="num">[types]</div><h3>Cast Dynamic columns</h3>
+    <p>Keys of joins, <code>argMax</code> and some aggregates need explicit casts: <code>product_id::String</code>, <code>ts::DateTime64(3)</code>.</p></div>
+  <div class="card"><div class="num">[connections]</div><h3>Few at a time</h3>
+    <p>Beyond ~5 parallel connections new ones are refused, so the builds use 2 workers and the service only two connections.</p></div>
+  <div class="card"><div class="num">[size]</div><h3>Split big results</h3>
+    <p>Results are capped at 100 MiB: large aggregates are fetched in hash parts and concatenated.</p></div>
+  <div class="card"><div class="num">[nulls]</div><h3>Empty is not null</h3>
+    <p>In the history <code>clicked</code> is null, in our feedback it is <code>""</code>: we normalise with <code>ifNull(clicked::String, '')</code>.</p></div>
+</div>
+
+<script>
+/*__CHARTS__*/
+const S = __STATS__;
+const $ = id => document.getElementById(id);
+const fmtN = v => v >= 1e6 ? (v / 1e6).toFixed(1) + " M" : v >= 1e3 ? (v / 1e3).toFixed(0) + " k" : String(v);
+$("rates").innerHTML = [
+  ["~" + S.stream.requests_per_s + " <small>/ s</small>", "shop.requests to answer"],
+  ["~" + S.stream.events_per_s + " <small>/ s</small>", "shop.events (views, carts, purchases)"],
+  ["~" + S.stream.catalog_updates_per_s + " <small>/ s</small>", "shop.catalog_updates"],
+  [(S.config.poll_s * 1000) + " <small>ms</small>", "our polling cycle"],
+].map(([v, c]) => `<div class="stat"><div class="v">${v}</div><div class="c">${c}</div></div>`).join("");
+const u = S.catalog.updates;
+$("upd").textContent = `${u.price_change.toLocaleString("en-US")} price changes, ${u.out_of_stock} out of stock, ${u.back_in_stock} back, ${u.new_product} new`;
+
+$("agg").textContent = fmtN(S.builds.live.reduce((a, r) => a + r.rows, 0)) + " rows";
+</script>
+</body>
+</html>

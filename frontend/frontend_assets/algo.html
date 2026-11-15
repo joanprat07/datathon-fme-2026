@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+/*__BASE_CSS__*/
+/*__PAGES_CSS__*/
+.diagram svg text { font-family: Roboto, sans-serif; }
+.lane-key { display: flex; gap: 22px; font: 12px "Roboto Mono", monospace; color: var(--g300); padding: 12px 16px; border-top: 1px solid var(--g800); }
+.lane-key i { display: inline-block; width: 12px; height: 12px; vertical-align: -1px; margin-right: 8px; border: 1px solid; }
+</style>
+</head>
+<body>
+<h2 class="sec">How pandabuy chooses ten products</h2>
+<p class="lead">For every request: <b>pre-select up to 300</b> of the ~5,000 products, <b>score</b> each one, answer the <b>10 highest</b> in order.</p>
+<div class="formula">a(user, product) = <span class="g">P(click | examined)</span> · <span class="v">P(purchase | click)</span>
+  &nbsp;<span class="d">= P(purchase | examined)</span></div>
+<div class="gap" style="height:16px"></div>
+<div class="stats" id="challenge"></div>
+<div class="gap" style="height:16px"></div>
+<div class="panel diagram">
+  <div class="panel-h"><span><b>One request, end to end</b></span><span>~1 ms of compute · answered in ~0.4 s</span></div>
+  <div class="body" id="figB"></div>
+</div>
+<div class="gap" style="height:16px"></div>
+<div class="panel diagram">
+  <div class="panel-h"><span><b>What we read vs. what we learn</b></span><span>data → state → model</span></div>
+  <div class="body" id="figA"></div>
+  <div class="lane-key">
+    <span><i style="border-color:#8fb0ff;background:#3d6fff22"></i>Data: RawTree tables</span>
+    <span><i style="border-color:#8d8d8d;background:#151515"></i>State: counters computed from the data</span>
+    <span><i style="border-color:#27f795;background:#27f79522"></i>Model: weights learned from clicks and purchases</span>
+  </div>
+</div>
+<div class="gap" style="height:16px"></div>
+<div class="stats" id="valid"></div>
+<div class="src" id="valid-src"></div>
+
+<script>
+/*__CHARTS__*/
+const S = __STATS__;
+const $ = id => document.getElementById(id);
+const pct = (v, d = 0) => (v * 100).toFixed(d) + "%";
+$("challenge").innerHTML = [
+  ["10", "distinct, active products per request, in order"],
+  ["&lt; 3 <small>s</small>", "from the request to our answer in RawTree"],
+  ["~" + S.stream.requests_per_s + " <small>/ s</small>", `shoppers, ${S.stream.new_user_share}% of them new (cold start)`],
+  [S.stream.baseline_live_cvr + " <small>%</small>", "conversion of the baseline (best sellers) live: the 0 of the score"],
+].map(([v, c]) => `<div class="stat"><div class="v">${v}</div><div class="c">${c}</div></div>`).join("");
+
+// ---------------------------------------------------------------- figure A: data / state / model
+(function figA() {
+  const W = 1180, H = 470;
+  const DATA = { s: "#8fb0ff", f: "#3d6fff1a" }, STATE = { s: "#8d8d8d", f: "#151515" }, MODEL = { s: "#27f795", f: "#27f79514" };
+  let g = `<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M0 0 L10 5 L0 10 z" fill="#8d8d8d"/></marker>
+    <marker id="arg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M0 0 L10 5 L0 10 z" fill="#27f795"/></marker></defs>`;
+  const box = (x, y, w, h, c, title, sub, mono = true, icon = false) => {
+    let s = `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c.f}" stroke="${c.s}"/>`;
+    const tx = x + (icon ? 40 : 16);
+    if (icon) s += `<g transform="translate(${x + 14},${y + h / 2 - 10})" fill="none" stroke="${c.s}" stroke-width="1.3">
+      <ellipse cx="9" cy="3" rx="9" ry="3"/><path d="M0 3 v14 a9 3 0 0 0 18 0 v-14"/><path d="M0 10 a9 3 0 0 0 18 0"/></g>`;
+    s += `<text x="${tx}" y="${y + h / 2 - 4}" font-size="15" fill="#fff" ${mono ? 'font-family="Roboto Mono, monospace"' : ""}>${title}</text>`;
+    s += `<text x="${tx}" y="${y + h / 2 + 15}" font-size="12.5" fill="#999">${sub}</text>`;
+    return s;
+  };
+  const head = (x, t, sub, col) => `<text x="${x}" y="22" font-size="12" fill="${col}" font-family="Roboto Mono, monospace" letter-spacing="1">${t}</text>
+    <text x="${x}" y="44" font-size="13" fill="#8d8d8d">${sub}</text>`;
+  g += head(10, "DATA · RawTree tables", "read, never learned", DATA.s);
+  g += head(430, "STATE · computed from the data", "in memory, refreshed every 0.3 s", "#bdbdbd");
+  g += head(860, "MODEL · learned weights", "the only part that is trained", MODEL.s);
+  const dataBoxes = [
+    ["shop.catalog + updates", `${S.catalog.n.toLocaleString("en-US")} products · price · stock · new`],
+    ["shop.history_events", "≈12 M views, carts, purchases"],
+    ["shop.events", "live views, carts, purchases"],
+    ["shop.history_sessions", "≈2 M old carousels: shown → click → buy"],
+    ["team_28.feedback", "live: what happened to our 10"],
+  ];
+  dataBoxes.forEach(([t, s], i) => { g += box(10, 70 + i * 68, 310, 56, DATA, t, s, true, true); });
+  const stateBoxes = [
+    ["Product counters", "views · carts · buys at 1 h, 1 day, 15 days"],
+    ["Co-visits", "viewed together · viewed → bought"],
+    ["Shopper profiles", "subcategories · brands · price · bought"],
+    ["Segment popularity", "what sells per device × region"],
+  ];
+  stateBoxes.forEach(([t, s], i) => { g += box(430, 70 + i * 78, 320, 62, STATE, t, s, false); });
+  const modelBoxes = [
+    ["Click model", "P(click | examined) · 36 weights"],
+    ["Purchase model", "P(purchase | click) · 36 weights"],
+    ["Examination curve", "e(k): how often slot k is looked at"],
+  ];
+  modelBoxes.forEach(([t, s], i) => { g += box(860, 70 + i * 88, 310, 70, MODEL, t, s, false); });
+  // data -> state
+  g += `<path d="M320 98 H360 M320 166 H360 M320 234 H360 M360 98 V234" stroke="#8d8d8d" fill="none"/>`;
+  g += `<path d="M360 166 H426" stroke="#8d8d8d" marker-end="url(#ar)"/>`;
+  g += `<text x="393" y="150" font-size="11" fill="#bdbdbd" text-anchor="middle" font-family="Roboto Mono, monospace">SQL</text>`;
+  g += `<text x="393" y="186" font-size="11" fill="#bdbdbd" text-anchor="middle" font-family="Roboto Mono, monospace">+ tails</text>`;
+  // state -> model (features)
+  g += `<path d="M750 190 H856" stroke="#8d8d8d" stroke-dasharray="4 4" marker-end="url(#ar)"/>`;
+  g += `<text x="805" y="178" font-size="11" fill="#bdbdbd" text-anchor="middle" font-family="Roboto Mono, monospace">36 features</text>`;
+  // sessions + feedback -> model (training)
+  g += `<path d="M320 302 H345 M320 370 H345 M345 302 V430 H1015 V320" stroke="#27f795" fill="none" marker-end="url(#arg)"/>`;
+  g += `<rect x="470" y="418" width="440" height="24" fill="#0a0a0a"/>`;
+  g += `<text x="690" y="435" font-size="12" fill="#27f795" text-anchor="middle" font-family="Roboto Mono, monospace">trains: history offline · our feedback online, row by row</text>`;
+  $("figA").innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%">${g}</svg>`;
+})();
+
+// ---------------------------------------------------------------- figure B: request flow
+(function figB() {
+  const W = 1180, H = 236, bw = 196, gap = (W - 20 - 5 * bw) / 4;
+  const steps = [
+    ["shop.requests", ["shopper, device, page,", "recent views"], "DATA · read", "#8fb0ff"],
+    ["1 · Pre-select", ["300 products from 6", "cheap sources"], "STATE", "#bdbdbd"],
+    ["2 · Score", ["a = P(click | examined)", "· P(buy | click)"], "MODEL · 36 features", "#27f795"],
+    ["3 · Top 10", ["sort · explore 8–10", "· fallback if invalid"], "RULES", "#f5c84c"],
+    ["team_28.submissions", ["one batched insert", "every 0.3 s"], "DATA · write", "#8fb0ff"],
+  ];
+  let g = `<defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M0 0 L10 5 L0 10 z" fill="#8d8d8d"/></marker>
+    <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M0 0 L10 5 L0 10 z" fill="#27f795"/></marker></defs>`;
+  steps.forEach(([t, d, chip, col], i) => {
+    const x = 10 + i * (bw + gap), y = 22, data = chip.startsWith("DATA");
+    g += `<rect x="${x}" y="${y}" width="${bw}" height="104" fill="${data ? "#3d6fff1a" : col === "#27f795" ? "#27f79514" : "#151515"}" stroke="${col}"/>`;
+    g += `<text x="${x + 14}" y="${y + 30}" font-size="${data ? 13 : 16}" fill="#fff" ${data ? 'font-family="Roboto Mono, monospace"' : ""}>${t}</text>`;
+    d.forEach((line, j) => { g += `<text x="${x + 14}" y="${y + 58 + j * 18}" font-size="12.5" fill="#999">${line}</text>`; });
+    g += `<text x="${x + 14}" y="${y + 126 + 18}" font-size="11" fill="${col}" font-family="Roboto Mono, monospace">[${chip}]</text>`;
+    if (i < steps.length - 1) g += `<path d="M${x + bw + 4} ${y + 52} H${x + bw + gap - 4}" stroke="#8d8d8d" marker-end="url(#ar2)"/>`;
+  });
+  const xs = 10 + 4 * (bw + gap) + bw / 2, xm = 10 + 2 * (bw + gap) + bw / 2;
+  g += `<path d="M${xs} 170 V200 H${xm} V174" stroke="#27f795" fill="none" stroke-dasharray="4 4" marker-end="url(#ar3)"/>`;
+  g += `<text x="${(xs + xm) / 2}" y="222" font-size="12" fill="#27f795" text-anchor="middle" font-family="Roboto Mono, monospace">team_28.feedback → one online update of the model</text>`;
+  $("figB").innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%">${g}</svg>`;
+})();
+
+
+// ---------------------------------------------------------------- offline validation, in numbers
+const m = S.metrics, [t0, v0, t1] = S.config.train.map(s => s.slice(0, 10));
+$("valid").innerHTML = [
+  [pct(m.recall_at_300, 1), "clicked product is inside our 300 candidates"],
+  ["+" + ((m.mrr_clicked_model / m.mrr_clicked_shown_order - 1) * 100).toFixed(0) + "%", "clicked product ranked higher than the old carousel (MRR)"],
+  ["−" + ((1 - m.click_logloss / m.click_logloss_slot_only) * 100).toFixed(0) + "%", "click log-loss vs a position-only model"],
+  [pct(S.exam[9]), "how often slot 10 is looked at, vs slot 1 (learned e(k))"],
+].map(([v, c]) => `<div class="stat"><div class="v">${v}</div><div class="c">${c}</div></div>`).join("");
+$("valid-src").textContent = `Offline validation: trained ${t0} → ${v0}, validated ${v0} → ${t1} on ${m.valid_clicked_sessions.toLocaleString("en-US")} clicked sessions of shop.history_sessions.`;
+</script>
+</body>
+</html>

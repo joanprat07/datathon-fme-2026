@@ -1,0 +1,42 @@
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400&family=Roboto+Mono:wght@300;400;500;700&display=swap');
+:root {
+  --green: #27f795; --red: #ff4f5e; --bg: #0a0a0a; --g900: #151515; --g800: #262626; --g700: #353535;
+  --g500: #636679; --g400: #8d8d8d; --g300: #999; --violet: #a594ff; --amber: #f5c84c;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0 2px; background: var(--bg); color: #fff; font-family: Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+.mono { font-family: "Roboto Mono", monospace; }
+.dim { color: var(--g400); }
+.green { color: var(--green); }
+.red { color: var(--red); }
+
+/* toolbar: [ label ] ......... controls */
+.bar { display: flex; justify-content: space-between; align-items: center; padding: 18px 0 14px;
+  font-family: "Roboto Mono", monospace; font-size: 13px; color: var(--g300); }
+.live { display: inline-flex; align-items: center; gap: 8px; color: var(--green); }
+.live::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+  box-shadow: 0 0 8px var(--green); animation: pulse 1.6s infinite; }
+.live.paused { color: var(--g400); } .live.paused::before { background: var(--g400); box-shadow: none; animation: none; }
+@keyframes pulse { 50% { opacity: .3; } }
+.ctrl { display: flex; gap: 0; border: 1px solid var(--g800); }
+.ctrl button { background: transparent; color: var(--g300); border: 0; font: 13px "Roboto Mono", monospace;
+  padding: 6px 12px; cursor: pointer; }
+.ctrl button + button { border-left: 1px solid var(--g800); }
+.ctrl button:hover { color: #fff; }
+.ctrl button.on { background: var(--green); color: var(--bg); }
+
+/* panel: thin border box, header strip */
+.panel { border: 1px solid var(--g800); background: var(--bg); position: relative; }
+.panel-h { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px;
+  border-bottom: 1px solid var(--g800); font: 13px "Roboto Mono", monospace; color: var(--g300); background: var(--g900); }
+.panel-h b { color: #fff; font-weight: 400; }
+
+.tag { font: 12px "Roboto Mono", monospace; color: var(--g300); white-space: nowrap; }
+
+/* stats like tinybird's big numbers */
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--g800); }
+.stat { padding: 18px 20px; }
+.stat + .stat { border-left: 1px solid var(--g800); }
+.stat .v { font-weight: 300; font-size: 38px; line-height: 44px; letter-spacing: -0.8px; font-variant-numeric: tabular-nums; }
+.stat .c { font: 12px "Roboto Mono", monospace; color: var(--g400); margin-top: 6px; }
+.stat .v small { font-size: 18px; color: var(--g400); letter-spacing: 0; }

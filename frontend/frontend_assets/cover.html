@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+/*__BASE_CSS__*/
+/*__PAGES_CSS__*/
+.cover { position: relative; padding: 64px 0 40px; overflow: hidden; }
+.cover::before { content: ""; position: absolute; inset: 0; pointer-events: none;
+  background-image: linear-gradient(var(--g900) 1px, transparent 1px), linear-gradient(90deg, var(--g900) 1px, transparent 1px);
+  background-size: 48px 48px; -webkit-mask-image: radial-gradient(ellipse at 50% 30%, #000 20%, transparent 75%);
+  mask-image: radial-gradient(ellipse at 50% 30%, #000 20%, transparent 75%); }
+.cover > * { position: relative; }
+.top { display: flex; justify-content: space-between; align-items: center; font: 13px "Roboto Mono", monospace; color: var(--g400); }
+.partner { display: flex; align-items: center; gap: 14px; }
+.partner img { height: 30px; display: block; }
+.wordmark { display: inline-flex; align-items: center; gap: 8px; font: 400 24px Roboto, sans-serif; color: #fff; letter-spacing: -0.5px; }
+.wordmark svg { width: 26px; height: 26px; }
+.title { text-align: center; margin: 70px 0 0; }
+.title .mark { width: 92px; height: 92px; margin: 0 auto 22px; display: block; }
+.title h1 { font: 400 112px/112px Roboto, sans-serif; letter-spacing: -4px; margin: 0; }
+.title h1 span { color: var(--green); }
+.title .sub { font: 300 22px/34px Roboto, sans-serif; color: var(--g300); max-width: 760px; margin: 26px auto 0; }
+.title .sub b { color: #fff; font-weight: 400; }
+.tags { display: flex; justify-content: center; margin-top: 30px; }
+.tags div { display: inline-flex; gap: 6px; padding: 6px; border: 1px solid var(--g800); background: var(--g900);
+  font: 13px "Roboto Mono", monospace; color: #ddd; }
+.tags span { padding: 4px 8px; } .tags span + span { border-left: 1px solid var(--g700); }
+.tags .on { color: var(--green); outline: 1px solid var(--g700); }
+.team { display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--g800); margin-top: 64px; }
+.member { padding: 20px 22px; display: flex; gap: 14px; align-items: center; }
+.member + .member { border-left: 1px solid var(--g800); }
+.member .av { width: 40px; height: 40px; border: 1px solid var(--green); color: var(--green); display: grid; place-items: center;
+  font: 14px "Roboto Mono", monospace; flex: none; }
+.member .nm { font: 400 18px Roboto, sans-serif; }
+.member .rl { font: 12px "Roboto Mono", monospace; color: var(--g500); margin-top: 3px; }
+.nums { margin-top: 16px; }
+.agenda { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 16px; }
+.agenda .card { min-height: 128px; }
+.foot { display: flex; justify-content: space-between; margin-top: 36px; font: 12px "Roboto Mono", monospace; color: var(--g500); }
+</style>
+</head>
+<body>
+<div class="cover">
+  <div class="top">
+    <span>[ Datathon FME 2026 · Real-time recommendation challenge ]</span>
+    <span class="partner"><span>challenge by</span>__TB_LOGO__</span>
+  </div>
+
+  <div class="title">
+    <svg class="mark" viewBox="0 0 92 92" aria-label="pandabuy">
+      <circle cx="20" cy="20" r="13" fill="#27f795"/><circle cx="72" cy="20" r="13" fill="#27f795"/>
+      <circle cx="46" cy="50" r="34" fill="#0a0a0a" stroke="#27f795" stroke-width="3"/>
+      <ellipse cx="33" cy="46" rx="8" ry="10" fill="#27f795" transform="rotate(-20 33 46)"/>
+      <ellipse cx="59" cy="46" rx="8" ry="10" fill="#27f795" transform="rotate(20 59 46)"/>
+      <circle cx="34" cy="46" r="3" fill="#0a0a0a"/><circle cx="58" cy="46" r="3" fill="#0a0a0a"/>
+      <path d="M41 62 h10 l-5 5 z" fill="#27f795"/>
+    </svg>
+    <h1>panda<span>buy</span></h1>
+    <div class="sub"><b>5,000 products, 10 slots, 3 seconds.</b> Show each shopper the ten they will buy.</div>
+    <div class="tags"><div><span>[Online learning]</span><span>[Click × purchase model]</span><span>[Position-debiased]</span>
+      <span>[Cold start]</span><span class="on">[Live on RawTree]</span></div></div>
+  </div>
+
+  <div class="team">
+    <div class="member"><div class="av">JP</div><div><div class="nm">Joan Prat</div><div class="rl">team_28</div></div></div>
+    <div class="member"><div class="av">RC</div><div><div class="nm">Roger Casas</div><div class="rl">team_28</div></div></div>
+    <div class="member"><div class="av">ÀS</div><div><div class="nm">Àlex Sánchez</div><div class="rl">team_28</div></div></div>
+    <div class="member"><div class="av">MP</div><div><div class="nm">Martí Pujadas</div><div class="rl">team_28</div></div></div>
+  </div>
+
+  <div class="stats nums" id="nums"></div>
+
+  <div class="agenda">
+    <div class="card"><div class="num">[01]</div><h3>The algorithm</h3>
+      <p>What we read from the data, what the model learns, and how 10 products come out of 5,000.</p></div>
+    <div class="card"><div class="num">[02]</div><h3>RawTree in our project</h3>
+      <p>Database and compute engine: SQL aggregation, live tails of the stream and batched answers.</p></div>
+    <div class="card"><div class="num">[03]</div><h3>Live: our model vs baseline</h3>
+      <p>Shoppers arriving, the ten products we answer, and the revenue against best sellers.</p></div>
+  </div>
+  <div class="foot"><span>pandabuy · team_28</span><span>Figures from our RawTree snapshots and offline validation</span><span>15 Nov 2026</span></div>
+</div>
+<script>
+const S = __STATS__;
+const n = v => v.toLocaleString("en-US");
+document.getElementById("nums").innerHTML = [
+  [n(S.catalog.n) + ` <small>+${S.catalog.updates.new_product} new</small>`, "products in the catalogue"],
+  [n(S.users), "shoppers with a profile"],
+  [n(S.sessions.n_true), "past carousels we train on (24 Oct – 14 Nov)"],
+  [S.dry[S.dry.length - 1].age_p95 + ` <small>s</small>`, "p95 answer time (limit 3 s)"],
+].map(([v, c]) => `<div class="stat"><div class="v">${v}</div><div class="c">${c}</div></div>`).join("");
+</script>
+</body>
+</html>
