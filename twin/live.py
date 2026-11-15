@@ -37,7 +37,8 @@ from twin.declog import DecLog
 from twin.recommend import Ranker, fallback, recommend
 from twin.rt import API, ARTIFACTS, TEAM
 from twin.state import NF, State
-from twin.variants import ARMS_FILE, LiveLayer, arms_from_env, parse_arms, pick_arm, read_arms_file
+from twin.variants import (ARMS_FILE, FINAL_START_MS, LiveLayer, arms_from_env, parse_arms, pick_arm,
+                           read_arms_file)
 
 VERSION = os.environ.get("TWIN_VERSION", "twin-v1")
 HOLDOUT = float(os.environ.get("TWIN_HOLDOUT", "0"))
@@ -69,6 +70,16 @@ SELECT s.p AS p, sum(s.e) AS expected, countIf(f.clicked = s.p) AS clicks FROM (
         FROM {team}.scratch WHERE kind::String = 'twin_pred')) AS s
 INNER JOIN (SELECT request_id::String AS rid, clicked::String AS clicked FROM {team}.feedback
             WHERE served_by::String = 'team') AS f ON f.rid = s.rid
+GROUP BY p"""
+LAYER_RESTORE = """
+SELECT s.p AS p, sum(s.e * s.w) AS expected, sumIf(s.w, f.clicked = s.p) AS clicks FROM (
+    SELECT rid, w, pe.1 AS p, pe.2 AS e FROM (
+        SELECT request_id::String AS rid,
+               exp2(-({now} - t::Int64) / {hl}) * if({now} >= {final} AND t::Int64 < {final}, 0.25, 1) AS w,
+               arrayJoin(arrayZip(items::Array(String), expected::Array(Float64))) AS pe
+        FROM {team}.scratch WHERE kind::String = 'twin_pred' AND t::Int64 > {now} - {window})) AS s
+INNER JOIN (SELECT request_id::String AS rid, any(clicked::String) AS clicked FROM {team}.feedback
+            WHERE served_by::String = 'team' GROUP BY rid) AS f ON f.rid = s.rid
 GROUP BY p"""
 BOUGHT_RESTORE = """
 SELECT r.user_id::String AS u, f.purchased::String AS p, toUnixTimestamp64Milli(f.ts::DateTime64(3)) AS t
@@ -141,8 +152,62 @@ class Writer(threading.Thread):
                 http = new_http()
 
 
-def restore(st: State, http: requests.Session) -> None:
-    """After a restart: bandit statistics and carousel purchases from what RawTree already holds."""
+class Clock(threading.Thread):
+    """The organisers' clock: our clock plus an offset measured against the server, and measured
+    again every minute. Measuring it once was fragile: this laptop runs ~1.7 s behind the server, so
+    if Windows corrected its clock mid-run every request would look 1.7 s older and most would be
+    skipped as "too old". Each measurement keeps the fastest of 3 round trips and takes the server
+    time as the middle of it."""
+
+    def __init__(self, interval: float = 60.0):
+        super().__init__(daemon=True, name="clock")
+        self.interval, self.errors = interval, 0
+        self.offset = self.measure(new_http())          # raises if the server cannot be reached at all
+
+    @staticmethod
+    def measure(http: requests.Session) -> int:
+        best = None
+        for _ in range(3):
+            try:
+                t0 = time.time()
+                server = int(sql(http, "SELECT toUnixTimestamp64Milli(now64(3)) AS t", timeout=(2, 3))[0]["t"])
+                t1 = time.time()
+            except Exception:
+                continue
+            if best is None or t1 - t0 < best[0]:
+                best = (t1 - t0, server - int((t0 + t1) * 500))
+        if best is None:
+            raise RuntimeError("server clock unreachable")
+        return best[1]
+
+    def now(self) -> int:
+        return int(time.time() * 1000) + self.offset
+
+    def run(self) -> None:
+        http = new_http()
+        while True:
+            time.sleep(self.interval)
+            try:
+                new = self.measure(http)
+            except Exception:
+                self.errors += 1
+                http = new_http()
+                continue
+            if abs(new - self.offset) > 250:
+                print(f"{time.strftime('%H:%M:%S')} server clock offset changed: {self.offset} -> {new} ms", flush=True)
+            self.offset = new
+
+
+def restore(st: State, http: requests.Session, layer: LiveLayer, now_ms: int) -> None:
+    """After a restart: bandit statistics, the m3 live layer and carousel purchases from what RawTree already holds."""
+    try:
+        rows = sql(http, LAYER_RESTORE.format(team=TEAM, now=int(now_ms), hl=int(layer.hl_ms), final=FINAL_START_MS,
+                                              window=int(6 * layer.hl_ms)), timeout=(3, 25))
+        n = layer.restore(st, rows, now_ms)
+        print(f"live layer restored for {n} products ({layer.click_obs.sum():.0f} clicks vs "
+              f"{layer.click_exp.sum():.0f} expected, decayed)")
+    except Exception as e:
+        print(f"live layer starts empty ({str(e)[:120]})")
     try:
         n = 0
         for r in sql(http, BANDIT_RESTORE.format(team=TEAM), timeout=(3, 25)):
@@ -210,17 +275,19 @@ def main(dry: bool, seconds: float = 0) -> None:
     print(f"state loaded in {time.time() - t0:.0f}s: {st.P} products ({int(st.is_new.sum())} new), {len(st.uidx)} users")
     print("arms: " + ", ".join(f"{v.name} {100 * w:.0f}%" for v, w in arms))
     http = new_http()
-    restore(st, http)
-    offset = int(sql(http, "SELECT toUnixTimestamp64Milli(now64(3)) AS t")[0]["t"]) - int(time.time() * 1000)
-    now = lambda: int(time.time() * 1000) + offset          # the organisers' clock
-    print(f"server clock offset {offset} ms | version {VERSION} | holdout {holdout:.0%} | {'DRY RUN' if dry else 'LIVE'}")
+    clock = Clock()
+    now = clock.now                                          # the organisers' clock
+    restore(st, http, layer, now())
+    print(f"server clock offset {clock.offset} ms | version {VERSION} | holdout {holdout:.0%} | {'DRY RUN' if dry else 'LIVE'}")
+    heartbeat = os.environ.get("TWIN_HEARTBEAT")             # set by twin.supervisor: proof the loop is not frozen
+    last_beat = 0.0
 
     inbox: queue.Queue = queue.Queue()
     feeds = [Feed("events", EVENTS, st.cutoff_ms, 3.0, 20000, inbox),
              Feed("catalog", CATALOG, st.catalog_cursor, 0.7, 2000, inbox),
              Feed("feedback", FEEDBACK, now() - 60_000, 3.0, 5000, inbox)]
     writer = Writer()
-    for th in (*feeds, writer, declog):
+    for th in (*feeds, writer, declog, clock):
         th.start()
 
     pending: OrderedDict[str, tuple] = OrderedDict()        # request -> (items, expected clicks, user, expected purchases)
@@ -237,6 +304,13 @@ def main(dry: bool, seconds: float = 0) -> None:
 
     while True:
         tick = time.time()
+        if heartbeat and tick - last_beat > 5:
+            try:
+                with open(heartbeat, "w") as f:
+                    f.write(str(tick))
+                last_beat = tick
+            except OSError:
+                pass
         # ---- 1. apply what the background threads brought (never more than 80 ms per tick) ------
         while time.time() - tick < 0.08:
             try:

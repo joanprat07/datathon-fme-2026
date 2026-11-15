@@ -56,9 +56,18 @@ def top(scores: np.ndarray, k: int) -> np.ndarray:
 
 
 def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], rng: np.random.Generator,
-               block_bought: bool = BLOCK_BOUGHT) -> np.ndarray:
+               block_bought: bool = BLOCK_BOUGHT, wide: bool = False) -> np.ndarray:
+    """`wide` (variant "wide") adds, without changing anything else:
+    - a shopper we know little about (fewer than 5 events; live, st.user() gives every shopper an
+      index, so "ui < 0" never happens) gets the top 300 by popularity instead of 40, and the top
+      100 of their device x region instead of 40. Measured on 406 validation purchases
+      (proves_numeriques/recall.py, 15/11 00:34): the cold pool held the bought product 82.0% of
+      the time, top-300 popularity alone 96.8%; known shoppers were at 98.5%.
+    - the last 10 views (not 5) vote together, each weighing 0.7x the one after it: products linked
+      to several recent views, above all the newest, enter the pool even if no single view ranks them."""
     n = st.P
-    picks: list[np.ndarray] = [st.pop_order[:40], top(st.car_clicks[:n], 20)]
+    thin = wide and (ui < 0 or st.u_events[ui] < 5)
+    picks: list[np.ndarray] = [st.pop_order[:300 if thin else 40], top(st.car_clicks[:n], 20)]
     subs: list[int] = []
     past: list[int] = []
 
@@ -69,6 +78,13 @@ def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], r
             picks.append(top(st.VV[a, :n] / st.nv[:n], 60 if j == 0 else 25))
             picks.append(top(st.VP[a, :n] / st.nb[:n], 30 if j == 0 else 10))
         subs += list(dict.fromkeys(int(s) for s in st.sub[recent]))[:2]
+        if wide:
+            last = np.asarray(list(dict.fromkeys(reversed(rv)))[:10])
+            w = 0.7 ** np.arange(len(last))
+            picks.append(last)
+            # each view's row is scaled by its own popularity, so one heavily viewed product cannot outvote the rest
+            picks.append(top((w[:, None] * st.VV[last, :n] / st.nv[last][:, None]).sum(0) / st.nv[:n], 80))
+            picks.append(top((w[:, None] * st.VP[last, :n] / st.nv[last][:, None]).sum(0) / st.nb[:n], 40))
 
     if ui >= 0:
         # the shopper's own products: what they bought and what they looked at most
@@ -89,7 +105,7 @@ def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], r
             picks.append(st.sub_top[s][:40 if j == 0 else 25])
 
     if dev >= 0 and reg >= 0:
-        picks.append(top(st.seg[dev, reg, :n], 40))
+        picks.append(top(st.seg[dev, reg, :n], 100 if thin else 40))
     trend = st.sub_trend(ts)
     for s in np.argsort(-trend)[:3]:
         if int(s) in st.sub_top:
@@ -107,6 +123,40 @@ def candidates(st: State, ts: int, dev: int, reg: int, ui: int, rv: list[int], r
     if block_bought and past:
         cand = cand[~np.isin(cand, past)]
     return cand
+
+
+def widen(st: State, rk: Ranker, layer, cand: np.ndarray, ts: int, ui: int, rv: list[int], block_bought: bool) -> np.ndarray:
+    """Variant "wide": two more sources of candidates that need the live layer or the embeddings.
+
+    - Price drops: the live layer boosts a product for an hour after its price falls by more than
+      10%, but only if something else had already made it a candidate. Here the 30 most popular
+      discounted products enter the pool, so a discount can be shown to anyone.
+    - New products in the session: a product added during the event has no co-views of its own
+      (it borrows its neighbours'). When one of the last views is new, the 30 products with the
+      closest description (content vectors of the v5 ranker) enter the pool too."""
+    more: list[np.ndarray] = []
+    if layer is not None:
+        hot = np.flatnonzero(layer.boost_until[:st.P] > ts)
+        if len(hot):
+            more.append(hot[np.argsort(-st.pop[hot])[:30]])
+    if rk.emb is not None and rv:
+        fresh = [a for a in dict.fromkeys(reversed(rv)) if st.is_new[a]][:2]
+        if fresh:
+            if rk.emb.content is None or st.P > rk.emb.n:
+                rk.emb._extend(st)
+            E = rk.emb.content[:st.P]
+            for a in fresh:
+                if float(E[a] @ E[a]) > 0.5:          # no usable description vector: nothing to look up
+                    more.append(top(E @ E[a], 30))
+    if not more:
+        return cand
+    add = np.unique(np.concatenate(more))
+    add = add[st.ok[add]]
+    if block_bought and ui >= 0:
+        past = st.bought_before(ui, ts)[0]
+        if past:
+            add = add[~np.isin(add, past)]
+    return np.union1d(cand, add)
 
 
 def fallback(st: State, exclude: set[int] = frozenset(), k: int = 10) -> list[int]:
@@ -134,7 +184,9 @@ def recommend(st: State, rk: Ranker, req: dict, rng: np.random.Generator, v: Var
     ui = st.user(str(req["user_id"]))
     rv = [st.idx[p] for p in (req.get("rv") or []) if p in st.idx]
 
-    cand = candidates(st, ts, dev, reg, ui, rv, rng, v.block_bought)
+    cand = candidates(st, ts, dev, reg, ui, rv, rng, v.block_bought, v.wide)
+    if v.wide:
+        cand = widen(st, rk, layer, cand, ts, ui, rv, v.block_bought)
     if len(cand) < 10:
         bought = set(st.bought_before(ui, ts)[0]) if v.block_bought else set()
         cand = np.unique(np.concatenate([cand, np.asarray(fallback(st, bought, 20), dtype=int)]))

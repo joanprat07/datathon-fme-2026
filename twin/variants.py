@@ -64,6 +64,7 @@ class Variant:
     bandit: bool = True           # correct the score with observed/expected clicks of our own carousels
     buy_power: float = 1.0        # score = p_click * p_buy ** buy_power
     price_eps: float = 0.0005     # score *= 1 + price_eps * price (revenue is only the tie-breaker)
+    wide: bool = False            # wider candidate pool: see candidates() and widen() in twin/recommend.py
 
 
 VARIANTS = {
@@ -80,6 +81,10 @@ VARIANTS = {
     "buy07": Variant("buy07", buy_power=0.7),
     "fb": Variant("fb", model="model_fb"),
     "v5-hybrid": Variant("v5-hybrid", model="model_v5"),   # twin-v1 + the 4 hybrid variables (twin/hybrid_live.py)
+    "wide": Variant("wide", wide=True),                    # more candidates: thin profiles, recency-weighted views, price drops, new products
+    "v6-fb": Variant("v6-fb", model="model_v6"),          # V5 retrained with our own feedback (twin/train_v6.py)
+    # V6 as served: the v6-fb ranker + intent slate + live layer + no exploration slots (all 10 by expected value)
+    "v6": Variant("v6", model="model_v6", slate="intent", live_layer=True, exploit_slots=10),
 }
 ARMS_FILE = ARTIFACTS.parent / "config" / "twin_arms.txt"
 
@@ -238,6 +243,25 @@ class LiveLayer:
             for a in (self.click_obs, self.click_exp, self.sub_obs, self.sub_exp, self.cat_buy_obs, self.cat_buy_exp):
                 a *= 0.25
             self.final_done = True
+
+    def restore(self, st: State, rows: list[dict], now_ms: float) -> int:
+        """After a restart: the click evidence of our recent carousels, already decayed to `now_ms`
+        (and cut to a quarter if it predates the final while the final is on) by LAYER_RESTORE in
+        twin/live.py. Purchases per category are not restored: they start neutral (clipped to 0.8-1.3)."""
+        n = 0
+        for r in rows:
+            i = st.idx.get(r["p"])
+            if i is None:
+                continue
+            e, c = float(r["expected"]), float(r["clicks"])
+            self.click_exp[i] += e
+            self.click_obs[i] += c
+            self.sub_exp[st.sub[i]] += e
+            self.sub_obs[st.sub[i]] += c
+            n += 1
+        self.t_bandit = float(now_ms)            # the rows are decayed to now: do not decay them again
+        self.final_done = now_ms >= FINAL_START_MS
+        return n
 
     def feedback(self, st: State, items: np.ndarray, exp_click: np.ndarray, exp_buy: np.ndarray,
                  clicked: int, bought: int, now_ms: float) -> None:
