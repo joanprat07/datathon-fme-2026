@@ -1,0 +1,14 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # test_v9 needs model_v5 and model_v7s, which are rebuilt from the challenge data and not committed
+      - run: python -m pytest -q tests --ignore=tests/test_v9.py

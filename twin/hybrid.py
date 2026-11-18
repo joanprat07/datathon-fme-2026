@@ -13,7 +13,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 from sklearn.metrics import log_loss, roc_auc_score
-from twin.state import State, FEATURES, CATEGORICAL, C0, to_ms
+from twin.state import State, FEATURES, CATEGORICAL, to_ms
 from twin.rt import ARTIFACTS
 
 EXTRA = ['content_session', 'content_user', 'collab_session', 'collab_user']

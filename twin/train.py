@@ -126,7 +126,7 @@ def main(refit: bool, keep_bought: bool = False, out: str = "model") -> None:
     # --keep-bought: nothing is left out; the ranker sees u_p_buys / u_p_buy_days and decides.
     bought = was_bought & (not keep_bought)
     click, buy = np.where(bought, 0, click).astype(np.int8), np.where(bought, 0, buy).astype(np.int8)
-    tr, va, cold = ~late & ~bought, va_all & ~bought, cold_all & ~bought   # cold: shopper hidden
+    tr, va = ~late & ~bought, va_all & ~bought
     print(f"left out {bought.sum():,} rows of already-bought products ({100 * bought.mean():.1f}%)")
     print(f"train rows {tr.sum():,} (clicks {click[tr].sum():,}, purchases {buy[tr].sum():,}) | "
           f"valid rows {va.sum():,} (clicks {click[va].sum():,}, purchases {buy[va].sum():,})")

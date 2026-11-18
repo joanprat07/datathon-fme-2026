@@ -27,7 +27,6 @@ Tests: `python -m pytest -q tests` (`test_v9.py` needs `artifacts/model_v5` and 
 
 ---
 
-
 A two-stage recommender with an online learning layer, for the RawTree challenge.
 
 ```
@@ -62,10 +61,8 @@ Settings for step 5 (environment variables):
   **`0` during the final round**.
 
 - `TWIN_ARMS` (default: none): compare model variants on live traffic. Each request goes to one arm by a
-  stable hash and the arm's name is its `model_version`, so step 6 shows them side by side. Example:
-  `TWIN_ARMS="twin-v1:60,m1-rebuy:20,m2-intent:10,m3-live:10"`. Variants are in `variants.py`; join two
-  with `+` to run both changes at once (`m1-rebuy+m3-live`). `m1-rebuy` needs its own model first:
-  `python -m twin.train --keep-bought --out model_rebuy --refit`. Use one arm during the final round.
+  stable hash and the arm's name is its `model_version`, so step 6 shows them side by side. Join pieces
+  with `+` (see `variants.py`). `config/twin_arms.txt`, if present, takes precedence and is re-read every 15 s.
 
 To restart the loop automatically if it ever stops: `python -m twin.supervisor` instead of step 5.
 
@@ -80,7 +77,7 @@ To restart the loop automatically if it ever stops: `python -m twin.supervisor` 
 | `recommend.py` | Candidates, ranking, bandit, filters: one request in, ten products out |
 | `live.py` | The loop: answers requests, follows events, catalogue updates and feedback in the background |
 | `monitor.py` | Reliability and conversion per model version, from our feedback |
-| `variants.py` | Model variants for live comparison: `m1-rebuy`, `m2-intent`, `m3-live` (see `docs/ANALISI_TWIN.md`) |
+| `variants.py` | The pieces of `v5tcs` and other variants for live comparison; reads `config/twin_arms.txt` |
 | `supervisor.py` | Starts the live loop and starts it again if it stops |
 | `hybrid.py`, `hybrid_live.py` | The 4 hybrid variables and the 60-variable ranker `model_v5` |
 | `train_v7.py` | The ranker for products without history (`model_v7s`, variant `cold8`) |

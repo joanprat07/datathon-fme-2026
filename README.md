@@ -1,124 +1,158 @@
-# Recomanador v5tcs
+# Real-time recommender · Datathon FME 2026
 
-Recomanador en temps real per a la botiga de RawTree (Datathon FME 2026, equip 28). Llegeix les
-peticions de `shop.requests`, tria 10 productes per a cada client i escriu la llista a
-`team_NN.submissions` en menys de 3 segons. Aprèn del feedback i dels esdeveniments de la botiga
-mentre està en marxa.
+[![tests](https://github.com/joanprat07/datathon-fme-2026/actions/workflows/tests.yml/badge.svg)](https://github.com/joanprat07/datathon-fme-2026/actions/workflows/tests.yml)
+![Python](https://img.shields.io/badge/python-3.13-blue)
 
-El model que hi ha és la versió final, `v5tcs`:
+A live product recommender that answers every shopper of an online store with 10 products in under
+3 seconds, and keeps learning from clicks and purchases while it runs. Built in a weekend by team 28
+for the RawTree challenge at the Datathon FME 2026 (UPC).
+
+<!-- TODO: add a screenshot or GIF of the presentation (frontend/pandabuy.html, "Live" tab) here:
+![demo](docs/demo.gif) -->
+
+**Result:** [placeholder: final ranking / conversion on the final round]
+
+## Highlights
+
+- **Two-stage recommender:** ~300 candidates (co-visits, shopper history, popularity, trends, new
+  products) re-ranked by LightGBM as `p(click) × p(purchase | click)`.
+- **Online learning:** a bandit layer corrects the ranker with our own live feedback, forgetting
+  with a 2-hour half-life.
+- **Cold start on both sides:** unknown shoppers (the ranker is also trained with the profile
+  hidden) and brand-new products (a second ranker, `model_v7s`, trained for them).
+- **Built for a hard deadline:** streaming loop with background threads, a hard network timeout,
+  and a best-seller fallback so every request gets a valid answer.
+- **Live A/B testing:** several model variants can serve side by side, switched without restarting.
+
+## How it works
+
+```
+request ─▶ candidates (~300) ─▶ LightGBM ranker ─▶ bandit correction ─▶ filters ─▶ 10 products
+              ▲                      ▲                   ▲
+   co-visits, user history,   trained on the old    our own feedback
+   popularity, trends, new    carousel's log        (observed vs expected clicks)
+```
+
+The final model, `v5tcs`, is a combination of small, separately tested pieces:
 
 ```
 v5tcs = v5-hybrid + m2-intent + m3-live + trend2 + cold8 + seedtrend
 ```
 
-| Peça | Què fa |
+| Piece | What it does |
 |---|---|
-| `v5-hybrid` | Ranker LightGBM de 60 variables: p(clic) × p(compra \| clic). Inclou 4 similituds de text i de co-visites amb la sessió i amb el perfil del client. |
-| `m2-intent` | Omple les 10 posicions segons la intenció del client, en lloc de posar com a màxim 5 productes per subcategoria. |
-| `m3-live` | Bandit que s'actualitza amb el feedback i oblida amb una semivida de 2 h. |
-| `trend2` | Dona més pes als productes que pugen els últims ~20 minuts (multiplicador entre 0,64 i 1,96). |
-| `cold8` | Els productes sense historial es puntuen amb un segon model (`model_v7s`), entrenat per a productes nous. |
-| `seedtrend` | Un producte nou comença amb la taxa heretada de productes semblants, perquè no surti com a "en alça" només per ser nou. |
+| `v5-hybrid` | LightGBM ranker with 60 features, including 4 text and co-visit similarities to the session and the shopper's profile |
+| `m2-intent` | Fills the 10 slots following the shopper's intent, instead of a fixed "at most 5 per subcategory" rule |
+| `m3-live` | Bandit updated from our feedback, with a 2 h half-life |
+| `trend2` | Boosts products rising in the last ~20 minutes (multiplier between 0.64 and 1.96) |
+| `cold8` | Products without history are scored by `model_v7s`, trained for new products |
+| `seedtrend` | New products start from the rate of similar products, so they don't look "rising" just for being new |
 
-No es recomana mai un producte que el client ja ha comprat. Si falla qualsevol cosa en puntuar,
-la resposta són els més venuts que hi ha en estoc.
+Products the shopper already bought are never recommended.
 
-## Contingut
+## Technical decisions and challenges
 
-```
-twin/            el codi del recomanador
-  rt.py            client de RawTree (llegeix .env)
-  build.py         baixa els agregats de RawTree a artifacts/train o artifacts/live
-  state.py         estat en memòria i càlcul de variables (el mateix per entrenar i per servir)
-  train.py         ranker base -> artifacts/model
-  hybrid.py        matriu d'entrenament amb les 4 variables híbrides
-  hybrid_live.py   embeddings + ranker de 60 variables -> artifacts/model_v5
-  train_v7.py      ranker per a productes nous -> artifacts/model_v7s
-  embeddings.py    vectors de text per a productes que apareixen en directe
-  recommend.py     candidats, rànquing, bandit i filtres
-  variants.py      definició de les peces de v5tcs i lectura de config/twin_arms.txt
-  live.py          bucle en directe
-  supervisor.py    arrenca live.py i el torna a arrencar si s'atura
-  monitor.py       conversió i fiabilitat a partir del nostre feedback
-  declog.py        guarda les variables de cada resposta a artifacts/declog/
-  train_feedback.py  reentrena amb aquest registre i el feedback
-config/twin_arms.txt   quin model serveix el bucle (es rellegeix cada 15 s)
-artifacts/model/       ranker base ja entrenat (els altres models s'han de generar)
-tests/                 proves amb pytest
-start_live.ps1         arrenca el supervisor en una finestra pròpia (Windows)
-```
+- **No leakage from the future.** Features come from events before 25 Oct; the ranker is trained on
+  sessions from 25 Oct to 11 Nov and validated on 11–14 Nov.
+- **Position bias.** The slot where the old carousel showed a product is a training feature; at
+  serving time every candidate is scored as if it were in slot 1.
+- **No product IDs in the model.** It learns rules (affinity, co-visits, price, popularity), so it
+  generalises to products and shoppers it has never seen.
+- **One feature function for training and serving** (`State.featurize`), so offline and live
+  numbers can't drift apart.
+- **Already-bought products.** In the old carousel's log they convert far better (≈0.7–4% vs
+  0.05%); we treated that as a bias of the log and block them. `BLOCK_BOUGHT` switches the rule.
+- **Reliability under a 3-second budget.** Only the main thread answers; event, catalogue and
+  feedback downloads run in background threads. A supervisor restarts the loop if it stops, and
+  the bandit state is saved so it survives a restart.
 
-`artifacts/` no es puja a Git excepte `artifacts/model/`. Les dades baixades, `model_v5` i
-`model_v7s` s'han de generar amb els passos de sota.
+More detail in [twin/README.md](twin/README.md).
 
-## Instal·lació
+### Offline validation
 
-Python 3.13 o més nou.
+Last 3 days of history, never seen in training. Among the 10 products the old carousel showed, how
+often is the model's first choice the product that was bought?
+
+| Ranking | First choice is the bought product |
+|---|---|
+| Random | 10% |
+| Popularity | 35% |
+| Our model, shopper unknown (cold) | 43% |
+| Our model | 48% |
+
+Purchase AUC 0.954 · click AUC 0.866 (vs 0.639 for a position-only model).
+
+## Tech stack
+
+Python 3.13 · LightGBM · scikit-learn (TF-IDF + SVD embeddings) · pandas · NumPy · SciPy ·
+RawTree (SQL over the event streams) · Streamlit (presentation) · pytest
+
+## Installation
 
 ```bash
-python -m venv venv
-source venv/bin/activate          # Windows: .\venv\Scripts\activate
+git clone https://github.com/joanprat07/datathon-fme-2026.git
+cd datathon-fme-2026
+python -m venv .venv
+source .venv/bin/activate          # Windows: .\.venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env              # i posa-hi TEAM_ID i RAWTREE_API_KEY
+cp .env.example .env               # then fill in TEAM_ID and RAWTREE_API_KEY
 ```
 
-El fitxer `.env` no es puja mai a Git.
+Running the pipeline needs credentials for the challenge's RawTree database. The tests and the
+presentation run without them.
 
-## Execució
+## Usage
 
-Totes les ordres es fan des de l'arrel del repositori.
+All commands from the repository root.
 
-| Pas | Ordre | Temps aprox. |
+| Step | Command | Time |
 |---|---|---|
-| 1. Dades d'entrenament | `python -m twin.build train` | 4 min |
-| 2. Ranker base | `python -m twin.train --refit` | 6 min |
-| 3. Matriu híbrida | `python -m twin.hybrid` | |
-| 4. Model v5 | `python -m twin.hybrid_live` | |
-| 5. Model per a productes nous | `python -m twin.train_v7 --out model_v7s` | uns minuts |
-| 6. Dades en directe | `python -m twin.build live` | 3 min |
-| 7. Prova sense enviar res | `python -m twin.live --dry --seconds 60` | 1 min |
-| 8. En directe | `python -m twin.supervisor` | indefinit |
-| 9. Resultats | `python -m twin.monitor 60` (últims 60 min) | segons |
+| 1. Training data | `python -m twin.build train` | ~4 min |
+| 2. Base ranker | `python -m twin.train --refit` | ~6 min |
+| 3. Hybrid feature matrix | `python -m twin.hybrid` | |
+| 4. 60-feature ranker | `python -m twin.hybrid_live` | |
+| 5. Ranker for new products | `python -m twin.train_v7 --out model_v7s` | a few min |
+| 6. Live snapshot | `python -m twin.build live` | ~3 min |
+| 7. Dry run (sends nothing) | `python -m twin.live --dry --seconds 60` | 1 min |
+| 8. Live | `python -m twin.supervisor` | runs forever |
+| 9. Results | `python -m twin.monitor 60` | seconds |
 
-Els passos 1 a 5 només cal tornar-los a fer si canvien les variables o els models. El pas 6 s'ha
-de repetir just abans d'arrencar el bucle: el bucle repassa els esdeveniments des del moment de
-la instantània, i si és antiga tarda a posar-se al dia.
+Which model serves is set in `config/twin_arms.txt` (one `name=recipe: share` per line, re-read
+every 15 s). With several lines the traffic is split and `twin.monitor` compares them.
 
-Notes:
-- Només hi pot haver **un** bucle en directe per equip. Abans d'arrencar-ne un, comprova que no
-  n'hi hagi cap altre en marxa (`start_live.ps1` ja ho comprova).
-- Cada reinici fa perdre aproximadament un minut de peticions. Per canviar de model no cal
-  reiniciar: n'hi ha prou d'editar `config/twin_arms.txt`.
-- Al pas 5 no sabem amb quines opcions exactes es va entrenar `model_v7s` per a la final. Les
-  opcions disponibles són a la capçalera de `twin/train_v7.py`.
+**Presentation:** open `frontend/pandabuy.html` in a browser, or run
+`pip install streamlit && cd frontend && streamlit run frontend.py`.
 
-## Configuració del model
-
-`config/twin_arms.txt`:
-
-```
-# comentari (la primera línia ha de ser un comentari)
-v5tcs=v5-hybrid+m2-intent+m3-live+trend2+cold8+seedtrend: 100
-holdout: 0
-```
-
-Cada línia és `nom=recepta: pes`. Amb més d'una línia, el trànsit es reparteix entre les
-receptes, i cada resposta porta el nom com a `model_version`, de manera que `twin.monitor` les
-pot comparar. `holdout` és el percentatge de peticions que es responen amb els més venuts, per
-mesurar la millora.
-
-Si el fitxer no existeix, es fan servir les variables d'entorn `TWIN_ARMS` (la mateixa sintaxi en
-una sola línia, separada per comes) i `TWIN_HOLDOUT` (fracció, p. ex. `0.1`). Si el fitxer
-existeix, té prioritat. `TWIN_ARMS_FILE` permet fer servir un altre fitxer.
-
-## Proves
+**Tests:**
 
 ```bash
-python -m pytest -q tests
+python -m pytest -q tests --ignore=tests/test_v9.py   # test_v9 needs the trained model_v5 and model_v7s
 ```
 
-`tests/test_v9.py` necessita `artifacts/model_v5` i `artifacts/model_v7s`. Sense aquests models,
-executa la resta amb `--ignore=tests/test_v9.py`.
+## Project structure
 
-Més detalls del disseny (separació temporal de les dades, biaix de posició, cold start) a
-[twin/README.md](twin/README.md).
+```
+twin/          the recommender: data, features, training, live loop, monitoring
+config/        which model variant serves live
+artifacts/     trained base ranker (other models and data are rebuilt by the steps above)
+frontend/      presentation: Streamlit app and a self-contained HTML export
+tests/         pytest suite
+```
+
+## Team
+
+- Joan Prat — [@joanprat07](https://github.com/joanprat07)
+- Roger Casas — [@Wanxer](https://github.com/Wanxer)
+- Àlex Sánchez — [@alexsanchezcastillo](https://github.com/alexsanchezcastillo)
+- Martí Pujadas — [@martipujadas](https://github.com/martipujadas)
+
+[placeholder: who did what, if the team agrees, e.g. "Joan: live loop and bandit"]
+
+## Roadmap
+
+- [placeholder: e.g. record the exact `model_v7s` training options used in the final]
+- [placeholder]
+
+## License
+
+[placeholder: licence agreed by the team, e.g. MIT]

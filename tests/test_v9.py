@@ -31,7 +31,7 @@ def test_v9_recipes_parse():
 
 
 def test_cold_blend_only_moves_new_products_and_keeps_scale():
-    st, rng = T.ST, np.random.default_rng(3)
+    st = T.ST
     keep = _mark_new(60)
     try:
         cand = np.flatnonzero(st.ok[:st.P])[:300]
