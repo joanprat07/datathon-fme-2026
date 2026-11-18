@@ -1,4 +1,4 @@
-"""pandabuy · presentation frontend: cover, algorithm, RawTree and a live simulation.
+"""ShopperTwin · presentation frontend: cover, algorithm, RawTree and a live simulation.
 
     cd frontend && streamlit run frontend.py     # from this folder, so .streamlit/config.toml (theme) is picked up
 
@@ -18,7 +18,7 @@ import streamlit as st
 ASSETS = Path(__file__).parent / "frontend_assets"
 SEED = 2026
 
-st.set_page_config(page_title="pandabuy · real-time recommendations", page_icon="🐼", layout="wide",
+st.set_page_config(page_title="ShopperTwin · real-time recommendations", page_icon="🛒", layout="wide",
                    initial_sidebar_state="collapsed")
 
 
@@ -68,13 +68,13 @@ def live() -> None:
 st.html(f"<style>{asset('style.css')}</style>")
 st.html("""
 <nav class="tb-nav">
-  <div class="tb-logo">panda<span class="tb-dim">buy</span></div>
+  <div class="tb-logo">Shopper<span class="tb-dim">Twin</span></div>
   <div class="tb-links"><span>Algorithm</span><span>Model <i>[FTRL]</i></span><span>RawTree<sup>[LIVE]</sup></span></div>
   <div class="tb-actions"><span class="tb-link-green">Datathon FME</span><span class="tb-btn">team_28</span></div>
 </nav>
 """)
 
-t0, t1, t2, t3 = st.tabs(["[00] pandabuy", "[01] The algorithm", "[02] RawTree", "[03] Live: pandabuy vs baseline"])
+t0, t1, t2, t3 = st.tabs(["[00] ShopperTwin", "[01] The algorithm", "[02] RawTree", "[03] Live: ShopperTwin vs baseline"])
 with t0:
     page("cover.html", __TB_LOGO__=partner_logo())
 with t1:

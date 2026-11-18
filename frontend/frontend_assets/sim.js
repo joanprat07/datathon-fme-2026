@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Synthetic shopper stream that follows the pandabuy algorithm (conv/).
+// Synthetic shopper stream that follows the ShopperTwin algorithm (conv/).
 //
 // Products are a real sample of shop.catalog (category, subcategory, brand, price,
 // 15-day purchases); shoppers are synthetic, with the real mix of pages, regions and

@@ -1,6 +1,6 @@
 """Export the whole presentation to one self-contained HTML file (no Streamlit needed to open it).
 
-    python frontend/export_html.py          # writes frontend/pandabuy.html
+    python frontend/export_html.py          # writes frontend/shoppertwin.html
 
 It runs frontend.py with a tiny stand-in for streamlit that collects the page parts,
 so the HTML is always the same as the Streamlit app.
@@ -13,7 +13,7 @@ import types
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-OUT = HERE / "pandabuy.html"
+OUT = HERE / "shoppertwin.html"
 
 
 def collect() -> tuple[list[str], list[str], list[str]]:
@@ -55,7 +55,7 @@ def main() -> None:
         f'<iframe data-i="{i}" srcdoc="{html.escape(p, quote=True)}" style="{"" if i == 0 else "display:none"}"></iframe>'
         for i, p in enumerate(pages))
     doc = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>pandabuy · real-time recommendations</title>
+<html><head><meta charset="utf-8"><title>ShopperTwin · real-time recommendations</title>
 {style}
 <style>
 body {{ margin: 0; }}

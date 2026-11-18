@@ -1,4 +1,4 @@
-# Real-time recommender · Datathon FME 2026
+# ShopperTwin · real-time recommender (Datathon FME 2026)
 
 [![tests](https://github.com/joanprat07/datathon-fme-2026/actions/workflows/tests.yml/badge.svg)](https://github.com/joanprat07/datathon-fme-2026/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
@@ -7,8 +7,7 @@ A live product recommender that answers every shopper of an online store with 10
 3 seconds, and keeps learning from clicks and purchases while it runs. Built in a weekend by team 28
 for the RawTree challenge at the Datathon FME 2026 (UPC).
 
-<!-- TODO: add a screenshot or GIF of the presentation (frontend/pandabuy.html, "Live" tab) here:
-![demo](docs/demo.gif) -->
+![ShopperTwin presentation](docs/cover.png)
 
 **Result:** [placeholder: final ranking / conversion on the final round]
 
@@ -120,7 +119,7 @@ All commands from the repository root.
 Which model serves is set in `config/twin_arms.txt` (one `name=recipe: share` per line, re-read
 every 15 s). With several lines the traffic is split and `twin.monitor` compares them.
 
-**Presentation:** open `frontend/pandabuy.html` in a browser, or run
+**Presentation:** open `frontend/shoppertwin.html` in a browser, or run
 `pip install streamlit && cd frontend && streamlit run frontend.py`.
 
 **Tests:**
