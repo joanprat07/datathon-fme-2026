@@ -5,7 +5,7 @@
 
 A live product recommender that answers every shopper of an online store with 10 products in under
 3 seconds, and keeps learning from clicks and purchases while it runs. Built in a weekend by team 28
-for the RawTree challenge at the Datathon FME 2026 (UPC).
+for the RawTree challenge (TinyBird) at the Datathon FME 2026 (UPC).
 
 ![ShopperTwin presentation](docs/cover.png)
 
