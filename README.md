@@ -155,4 +155,4 @@ tests/         pytest suite
 
 ## License
 
-[placeholder: licence agreed by the team, e.g. MIT]
+[MIT](LICENSE)
