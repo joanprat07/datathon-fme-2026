@@ -9,7 +9,8 @@ for the RawTree challenge at the Datathon FME 2026 (UPC).
 
 ![ShopperTwin presentation](docs/cover.png)
 
-**Result:** [placeholder: final ranking / conversion on the final round]
+**Result:** 🏆 **Rookie Award** (best team of first- and second-year students across all challenges) ·
+**9th of 42 teams** in the RawTree challenge, with a 2.0194% conversion rate on the final round (best team: 2.2520%).
 
 ## Highlights
 
@@ -145,12 +146,14 @@ tests/         pytest suite
 - Àlex Sánchez — [@alexsanchezcastillo](https://github.com/alexsanchezcastillo)
 - Martí Pujadas — [@martipujadas](https://github.com/martipujadas)
 
-[placeholder: who did what, if the team agrees, e.g. "Joan: live loop and bandit"]
-
 ## Roadmap
 
-- [placeholder: e.g. record the exact `model_v7s` training options used in the final]
-- [placeholder]
+- Make every model fully reproducible: record the exact training options of `model_v7s` used in
+  the final and rebuild all models with a single command.
+- Retrain the ranker on a schedule from our own live feedback log (`twin.train_feedback`), instead
+  of only from the old carousel's log.
+- Replace the TF-IDF + SVD product vectors with sentence embeddings, to find better neighbours for
+  brand-new products.
 
 ## License
 
